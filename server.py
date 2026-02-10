@@ -13,9 +13,7 @@ from pyrogram.file_id import FileId
 import uvicorn
 import config
 
-# --- Setup Client (Single Instance) ---
-# We use in_memory=True, but since there is only 1 client now, 
-# it won't conflict with anything else.
+# --- Single Client (Bot + Userbot) ---
 client = Client(
     "unified_session",
     api_id=config.API_ID,
@@ -30,22 +28,23 @@ app = FastAPI()
 active_streams_count = 0
 lock = asyncio.Lock()
 
-# ==============================
-#  BOT LOGIC (Handlers)
-# ==============================
-
+# --- Helper Functions ---
 def generate_secure_link(file_id: str) -> str:
     expiry = int(time.time()) + config.TOKEN_EXPIRY
     payload = f"{file_id}{expiry}".encode()
     token = hmac.new(config.SECRET_KEY.encode(), payload, hashlib.sha256).hexdigest()
     return f"{config.BASE_URL}/stream?file_id={quote(file_id)}&token={token}&exp={expiry}"
 
+def verify_token(file_id: str, token: str, expiry: int) -> bool:
+    if time.time() > expiry: return False
+    payload = f"{file_id}{expiry}".encode()
+    expected = hmac.new(config.SECRET_KEY.encode(), payload, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, token)
+
+# --- Bot Handlers ---
 @client.on_message(filters.command("start"))
 async def start_handler(c: Client, m: Message):
-    await m.reply_text(
-        "**Bot is Online!** (Unified Server) 🟢\n\n"
-        "Send me an MKV file to get a stream link."
-    )
+    await m.reply_text("✅ **Bot Online!**\nSend me an MKV file to stream.")
 
 @client.on_message(filters.video | filters.document)
 async def video_handler(c: Client, m: Message):
@@ -55,32 +54,23 @@ async def video_handler(c: Client, m: Message):
     link = generate_secure_link(media.file_id)
     filename = media.file_name or "video.mkv"
     
+    # Note: Link is NOT in backticks now, so it will be clickable
     await m.reply_text(
-        f"**File:** `{filename}`\n\n"
-        f"**Stream Link:**\n`{link}`\n\n"
-        f"__Expires in {config.TOKEN_EXPIRY // 60} mins.__"
+        f"🎬 **File:** `{filename}`\n\n"
+        f"🔗 **Stream Link:**\n{link}\n\n"
+        f"⚠️ Expires in {config.TOKEN_EXPIRY // 60} mins."
     )
 
-# ==============================
-#  SERVER LOGIC (Streaming)
-# ==============================
-
+# --- Server Logic ---
 @app.on_event("startup")
 async def startup_event():
-    print("Starting Telegram Client...")
+    print("Starting Client...")
     await client.start()
-    print("Client Started!")
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    print("Stopping Telegram Client...")
+    print("Stopping Client...")
     await client.stop()
-
-def verify_token(file_id: str, token: str, expiry: int) -> bool:
-    if time.time() > expiry: return False
-    payload = f"{file_id}{expiry}".encode()
-    expected = hmac.new(config.SECRET_KEY.encode(), payload, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, token)
 
 class StreamManager:
     async def __aenter__(self):
@@ -99,7 +89,6 @@ async def file_generator(client: Client, file_id: str, start: int, end: int):
     chunk_size = 1024 * 1024
     offset = start
     left = end - start + 1
-    
     while left > 0:
         fetch = min(chunk_size, left)
         async for chunk in client.stream_media(file_id, offset=offset, limit=fetch):
@@ -122,7 +111,6 @@ async def stream_route(request: Request, file_id: str, token: str, exp: int):
 
     range_header = request.headers.get("range")
     start, end = 0, file_size - 1
-    
     if range_header:
         try:
             unit, r = range_header.split("=")
@@ -136,7 +124,6 @@ async def stream_route(request: Request, file_id: str, token: str, exp: int):
         return Response(status_code=416, headers={"Content-Range": f"bytes */{file_size}"})
 
     end = min(end, file_size - 1)
-    
     headers = {
         "Content-Range": f"bytes {start}-{end}/{file_size}",
         "Accept-Ranges": "bytes",
