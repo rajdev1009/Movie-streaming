@@ -7,11 +7,13 @@ from pyrogram import Client, filters
 from pyrogram.types import Message
 import config
 
+# UPDATE: in_memory=True added to prevent database locks
 app = Client(
     "bot_session",
     api_id=config.API_ID,
     api_hash=config.API_HASH,
-    bot_token=config.BOT_TOKEN
+    bot_token=config.BOT_TOKEN,
+    in_memory=True
 )
 
 def generate_secure_link(file_id: str) -> str:
@@ -34,10 +36,6 @@ async def handle_video(client: Client, message: Message):
     media = message.video or message.document
     if not media:
         return
-
-    # In a real scenario, you might need to handle file_ref or access_hash carefully.
-    # For a bot admin in a channel, file_id is usually sufficient for the same bot to retrieve it.
-    # We assume the bot can see the message.
     
     file_id = media.file_id
     file_name = media.file_name or "video.mkv"
@@ -53,4 +51,4 @@ async def handle_video(client: Client, message: Message):
 if __name__ == "__main__":
     print("Bot started...")
     app.run()
-  
+    
