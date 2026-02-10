@@ -6,11 +6,8 @@ from urllib.parse import quote
 
 from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.responses import StreamingResponse, HTMLResponse
-from pyrogram import Client, filters, raw
+from pyrogram import Client, filters
 from pyrogram.types import Message
-from pyrogram.raw.functions.upload import GetFile
-from pyrogram.raw.types import InputDocumentFileLocation, InputPhotoFileLocation
-from pyrogram.file_id import FileId, FileType
 import uvicorn
 import config
 
@@ -21,7 +18,8 @@ client = Client(
     api_hash=config.API_HASH,
     bot_token=config.BOT_TOKEN,
     in_memory=True,
-    ipv6=False
+    ipv6=False,
+    workers=4
 )
 
 app = FastAPI()
@@ -88,75 +86,38 @@ class StreamManager:
         async with lock:
             active_streams_count -= 1
 
-# --- THE STABLE GENERATOR (1MB Fixed) ---
+# --- FIX: NATIVE GENERATOR (Auto DC Switch) ---
 async def file_generator(client: Client, file_id_str: str, start: int, end: int):
-    try:
-        decoded = FileId.decode(file_id_str)
-        if decoded.file_type == FileType.PHOTO:
-            location = InputPhotoFileLocation(
-                id=decoded.media_id, access_hash=decoded.access_hash,
-                file_reference=decoded.file_reference, thumb_size=decoded.thumbnail_size
-            )
-        else:
-            location = InputDocumentFileLocation(
-                id=decoded.media_id, access_hash=decoded.access_hash,
-                file_reference=decoded.file_reference, thumb_size=decoded.thumbnail_size
-            )
-    except: return
-
-    # 1. Align Offset (4KB Rule) - यह Seek Error को रोकता है
-    offset = start - (start % 4096)
-    first_chunk_skip = start - offset
+    total_bytes_to_serve = end - start + 1
+    bytes_served = 0
     
-    # 2. FIXED LIMIT (1 MB) - यह सबसे स्टेबल है
-    limit = 1024 * 1024
-
-    while offset <= end:
-        try:
-            r = await client.invoke(
-                GetFile(
-                    location=location,
-                    offset=offset,
-                    limit=limit 
-                )
-            )
+    try:
+        # stream_media handles FILE_MIGRATE automatically
+        async for chunk in client.stream_media(file_id_str, offset=start):
+            chunk_len = len(chunk)
             
-            if not r or not r.bytes: break
-            
-            chunk = r.bytes
-            
-            # Trim Logic (ताकि सही डेटा मिले)
-            if first_chunk_skip > 0:
-                if len(chunk) > first_chunk_skip:
-                    chunk = chunk[first_chunk_skip:]
-                    first_chunk_skip = 0
-                else:
-                    first_chunk_skip -= len(chunk)
-                    offset += len(r.bytes)
-                    continue
-
-            bytes_left = end - (offset + (len(r.bytes) - len(chunk))) + 1
-            if len(chunk) > bytes_left:
-                chunk = chunk[:bytes_left]
-            
-            if not chunk: break
+            if bytes_served + chunk_len > total_bytes_to_serve:
+                remaining = total_bytes_to_serve - bytes_served
+                yield chunk[:remaining]
+                break
             
             yield chunk
+            bytes_served += chunk_len
             
-            offset += len(r.bytes)
-            
-        except Exception as e:
-            print(f"Gen Error: {e}")
-            break
+            if bytes_served >= total_bytes_to_serve:
+                break
+                
+    except Exception as e:
+        print(f"Stream Error: {e}")
+        pass
 
-# --- UI HTML Player (Final Design) ---
+# --- UI HTML Player ---
 @app.get("/watch", response_class=HTMLResponse)
 async def watch_video(request: Request, file_id: str, size: int, token: str, exp: int):
     if not verify_token(file_id, token, exp): return "<h1>Invalid/Expired Link</h1>"
     stream_url = generate_secure_link(file_id, size, endpoint="stream")
     download_url = generate_secure_link(file_id, size, endpoint="download")
     
-    # UI Assets
     profile_img_url = "https://i.ibb.co/kY1Nyzs/1765464889401-2.jpg"
     random_middle_img = "https://picsum.photos/150/100?grayscale"
     playit_icon_url = "https://cdn-icons-png.flaticon.com/512/0/375.png"
@@ -188,7 +149,6 @@ async def watch_video(request: Request, file_id: str, size: int, token: str, exp
             .dl-big {{ font-size: 1.6em; font-weight: 900; display: block; text-transform: uppercase; }}
             .dl-icon-right {{ font-size: 1.8em; margin-left: 15px; }}
             .footer-text {{ font-weight: bold; margin-bottom: 15px; font-size: 1.2em; }}
-            @media (max-width: 400px) {{ .header-title {{ font-size: 2.8em; }} .channel-name {{ font-size: 2.2em; }} .player-link {{ font-size: 1.8em; }} .middle-img {{ max-width: 100px; }} }}
         </style>
     </head>
     <body>
@@ -264,4 +224,4 @@ async def download_route(request: Request, file_id: str, size: int, token: str, 
 
 if __name__ == "__main__":
     uvicorn.run(app, host=config.BIND_ADDR, port=config.PORT)
-            
+    
