@@ -13,7 +13,7 @@ import uvicorn
 import config
 
 # --- Client Setup ---
-# FIX: ipv6=False added to prevent network timeouts
+# ipv6=False is important for stability on Koyeb
 client = Client(
     "unified_session",
     api_id=config.API_ID,
@@ -87,20 +87,35 @@ class StreamManager:
         async with lock:
             active_streams_count -= 1
 
-# FIX: Simplified generator to prevent OFFSET_INVALID
+# --- CORE FIX: Manual Chunk Generator ---
 async def file_generator(client: Client, file_id: str, start: int, end: int):
-    # We ask Pyrogram for the exact range we need.
-    # Pyrogram handles the chunking internally.
-    req_length = end - start + 1
-    if req_length <= 0: return
+    offset = start
+    total_to_fetch = end - start + 1
+    chunk_size = 1024 * 1024  # 1 MB Request Block
 
-    try:
-        async for chunk in client.stream_media(file_id, offset=start, limit=req_length):
-            if not chunk: break
-            yield chunk
-    except Exception as e:
-        print(f"Stream Error: {e}")
-        pass
+    # Loop until we fetch all requested bytes
+    while total_to_fetch > 0:
+        # Calculate how much to fetch in this iteration (max 1MB)
+        current_fetch_limit = min(total_to_fetch, chunk_size)
+        
+        try:
+            # We create a FRESH iterator for every 1MB block.
+            # This prevents Pyrogram's internal offset tracking from getting corrupted.
+            async for chunk in client.stream_media(file_id, offset=offset, limit=current_fetch_limit):
+                if not chunk:
+                    break
+                yield chunk
+                
+                # Manually update tracking
+                chunk_len = len(chunk)
+                offset += chunk_len
+                total_to_fetch -= chunk_len
+                
+                if total_to_fetch <= 0:
+                    break
+        except Exception as e:
+            print(f"Stream Error at offset {offset}: {e}")
+            break
 
 @app.get("/stream")
 async def stream_route(request: Request, file_id: str, size: int, token: str, exp: int):
