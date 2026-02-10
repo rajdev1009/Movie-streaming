@@ -3,13 +3,12 @@ import hmac
 import hashlib
 import asyncio
 from urllib.parse import quote
-from typing import Generator
 
 from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.responses import StreamingResponse, HTMLResponse
 from pyrogram import Client, filters
 from pyrogram.types import Message
-# RAW Telegram Functions (Crucial for stability)
+# RAW Telegram Functions (Required for stability)
 from pyrogram.raw.functions.upload import GetFile
 from pyrogram.raw.types import InputDocumentFileLocation
 from pyrogram.file_id import FileId
@@ -100,7 +99,7 @@ class StreamManager:
         async with lock:
             active_streams_count -= 1
 
-# --- THE FIX: Robust Raw Chunk Generator ---
+# --- THE FIX: Fixed Chunk Size Generator ---
 async def file_generator(client: Client, file_id_str: str, start: int, end: int):
     try:
         decoded = FileId.decode(file_id_str)
@@ -114,24 +113,18 @@ async def file_generator(client: Client, file_id_str: str, start: int, end: int)
         return
 
     offset = start
-    # FIX: Always request 1MB blocks to satisfy Telegram's 4KB alignment rule
-    chunk_limit = 1024 * 1024 
+    # 1MB Chunk Size (Telegram loves this number)
+    limit = 1024 * 1024 
     
-    while True:
-        # Calculate how much we ACTUALLY need to send to browser
-        left_to_send = end - offset + 1
-        if left_to_send <= 0:
-            break
-        
+    while offset <= end:
         try:
-            # We ask Telegram for 1MB. 
-            # If file has only 100 bytes left, Telegram will return 100 bytes automatically.
-            # We DO NOT reduce 'limit' manually, that causes [400 LIMIT_INVALID]
+            # ERROR FIX: We ALWAYS ask for 1MB. We do NOT calculate specific limits.
+            # Telegram automatically handles the end of the file.
             r = await client.invoke(
                 GetFile(
                     location=location,
                     offset=offset,
-                    limit=chunk_limit 
+                    limit=limit 
                 )
             )
             
@@ -139,20 +132,27 @@ async def file_generator(client: Client, file_id_str: str, start: int, end: int)
                 break
             
             chunk = r.bytes
-            chunk_len = len(chunk)
             
-            # If we got more data than needed for this specific HTTP range, slice it.
-            if chunk_len > left_to_send:
-                chunk = chunk[:left_to_send]
+            # Logic: If we fetched more data than needed to reach 'end',
+            # we slice it here so the Browser doesn't get confused.
+            # But the request to Telegram was still valid (1MB).
+            
+            bytes_left_in_request = end - offset + 1
+            if len(chunk) > bytes_left_in_request:
+                chunk = chunk[:bytes_left_in_request]
             
             yield chunk
             offset += len(chunk)
+            
+            # Break if we are done
+            if len(chunk) == 0:
+                break
             
         except Exception as e:
             print(f"Gen Error: {e}")
             break
 
-# --- HTML Player (Centered + Playit + VLC) ---
+# --- HTML Player ---
 @app.get("/watch", response_class=HTMLResponse)
 async def watch_video(request: Request, file_id: str, size: int, token: str, exp: int):
     if not verify_token(file_id, token, exp):
