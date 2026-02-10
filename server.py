@@ -9,7 +9,7 @@ from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.responses import StreamingResponse, HTMLResponse
 from pyrogram import Client, filters
 from pyrogram.types import Message
-# RAW Telegram Functions (To bypass Pyrogram errors)
+# RAW Telegram Functions (Crucial for stability)
 from pyrogram.raw.functions.upload import GetFile
 from pyrogram.raw.types import InputDocumentFileLocation
 from pyrogram.file_id import FileId
@@ -23,7 +23,7 @@ client = Client(
     api_hash=config.API_HASH,
     bot_token=config.BOT_TOKEN,
     in_memory=True,
-    ipv6=False # Network Stability
+    ipv6=False  # Keeps connection stable
 )
 
 app = FastAPI()
@@ -31,6 +31,16 @@ app = FastAPI()
 # --- Global State ---
 active_streams_count = 0
 lock = asyncio.Lock()
+
+# --- Helper: File Size Formatter ---
+def human_size(bytes, units=['B', 'KB', 'MB', 'GB', 'TB']):
+    if bytes < 1024:
+        return f"{int(bytes)} {units[0]}"
+    for unit in units:
+        if bytes < 1024:
+            return f"{bytes:.2f} {unit}"
+        bytes /= 1024
+    return f"{bytes:.2f} {units[-1]}"
 
 # --- Security ---
 def generate_secure_link(file_id: str, file_size: int, endpoint: str = "watch") -> str:
@@ -61,7 +71,7 @@ async def video_handler(c: Client, m: Message):
     
     await m.reply_text(
         f"🎬 **File:** `{filename}`\n"
-        f"📦 **Size:** `{round(file_size / (1024*1024), 2)} MB`\n\n"
+        f"📦 **Size:** `{human_size(file_size)}`\n\n"
         f"▶️ **Click to Watch:**\n{watch_link}\n\n"
         f"⚠️ Expires in {config.TOKEN_EXPIRY // 60} mins."
     )
@@ -90,11 +100,9 @@ class StreamManager:
         async with lock:
             active_streams_count -= 1
 
-# --- THE FIX: Raw Chunk Generator ---
-# This bypasses Pyrogram's stream_media logic entirely to prevent OffsetInvalid
+# --- THE FIX: Robust Raw Chunk Generator ---
 async def file_generator(client: Client, file_id_str: str, start: int, end: int):
     try:
-        # Decode the FileID to get raw location data
         decoded = FileId.decode(file_id_str)
         location = InputDocumentFileLocation(
             id=decoded.media_id,
@@ -106,40 +114,45 @@ async def file_generator(client: Client, file_id_str: str, start: int, end: int)
         return
 
     offset = start
-    # We request exactly 1MB chunks (1024*1024)
+    # FIX: Always request 1MB blocks to satisfy Telegram's 4KB alignment rule
     chunk_limit = 1024 * 1024 
     
     while True:
-        # Calculate how many bytes are left to send in this Range request
+        # Calculate how much we ACTUALLY need to send to browser
         left_to_send = end - offset + 1
         if left_to_send <= 0:
             break
         
-        # We ask Telegram for EITHER 1MB OR whatever is left (whichever is smaller)
-        # This prevents asking for bytes beyond the file size (OFFSET_INVALID fix)
-        request_size = min(left_to_send, chunk_limit)
-        
         try:
-            # Direct RAW API call
+            # We ask Telegram for 1MB. 
+            # If file has only 100 bytes left, Telegram will return 100 bytes automatically.
+            # We DO NOT reduce 'limit' manually, that causes [400 LIMIT_INVALID]
             r = await client.invoke(
                 GetFile(
                     location=location,
                     offset=offset,
-                    limit=request_size
+                    limit=chunk_limit 
                 )
             )
             
             if not r or not r.bytes:
                 break
-                
-            yield r.bytes
-            offset += len(r.bytes)
+            
+            chunk = r.bytes
+            chunk_len = len(chunk)
+            
+            # If we got more data than needed for this specific HTTP range, slice it.
+            if chunk_len > left_to_send:
+                chunk = chunk[:left_to_send]
+            
+            yield chunk
+            offset += len(chunk)
             
         except Exception as e:
             print(f"Gen Error: {e}")
             break
 
-# --- HTML Player (Centered + Playit) ---
+# --- HTML Player (Centered + Playit + VLC) ---
 @app.get("/watch", response_class=HTMLResponse)
 async def watch_video(request: Request, file_id: str, size: int, token: str, exp: int):
     if not verify_token(file_id, token, exp):
@@ -191,7 +204,9 @@ async def watch_video(request: Request, file_id: str, size: int, token: str, exp
                 display: flex;
                 align-items: center;
                 background: #333;
+                transition: transform 0.2s;
             }}
+            .btn:active {{ transform: scale(0.95); }}
             .vlc {{ background: linear-gradient(45deg, #ff5722, #ff9800); }}
             .playit {{ background: linear-gradient(45deg, #5c3eff, #9e3eff); }}
         </style>
