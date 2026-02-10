@@ -6,9 +6,11 @@ from urllib.parse import quote
 
 from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.responses import StreamingResponse, HTMLResponse
-from pyrogram import Client, filters
+from pyrogram import Client, filters, raw
 from pyrogram.types import Message
-from pyrogram.file_id import FileId
+from pyrogram.raw.functions.upload import GetFile
+from pyrogram.raw.types import InputDocumentFileLocation, InputPhotoFileLocation
+from pyrogram.file_id import FileId, FileType
 import uvicorn
 import config
 
@@ -19,8 +21,7 @@ client = Client(
     api_hash=config.API_HASH,
     bot_token=config.BOT_TOKEN,
     in_memory=True,
-    ipv6=False, # Stability for Koyeb
-    workers=4   # Better performance
+    ipv6=False
 )
 
 app = FastAPI()
@@ -87,37 +88,68 @@ class StreamManager:
         async with lock:
             active_streams_count -= 1
 
-# --- NATIVE GENERATOR (The Fix) ---
-# We use Pyrogram's internal stream_media to handle DC switching automatically
+# --- THE STABLE GENERATOR (1MB Fixed) ---
 async def file_generator(client: Client, file_id_str: str, start: int, end: int):
-    # Calculate total bytes to fetch
-    total_bytes_to_serve = end - start + 1
-    bytes_served = 0
-    
     try:
-        # We ask Pyrogram to start streaming from the requested 'start' byte.
-        # It handles encryption, DC migration (FILE_MIGRATE), and chunking internally.
-        async for chunk in client.stream_media(file_id_str, offset=start):
-            chunk_len = len(chunk)
+        decoded = FileId.decode(file_id_str)
+        if decoded.file_type == FileType.PHOTO:
+            location = InputPhotoFileLocation(
+                id=decoded.media_id, access_hash=decoded.access_hash,
+                file_reference=decoded.file_reference, thumb_size=decoded.thumbnail_size
+            )
+        else:
+            location = InputDocumentFileLocation(
+                id=decoded.media_id, access_hash=decoded.access_hash,
+                file_reference=decoded.file_reference, thumb_size=decoded.thumbnail_size
+            )
+    except: return
+
+    # 1. Align Offset (4KB Rule) - यह Seek Error को रोकता है
+    offset = start - (start % 4096)
+    first_chunk_skip = start - offset
+    
+    # 2. FIXED LIMIT (1 MB) - यह सबसे स्टेबल है
+    limit = 1024 * 1024
+
+    while offset <= end:
+        try:
+            r = await client.invoke(
+                GetFile(
+                    location=location,
+                    offset=offset,
+                    limit=limit 
+                )
+            )
             
-            # If this chunk contains more data than needed to reach 'end', trim it
-            if bytes_served + chunk_len > total_bytes_to_serve:
-                remaining = total_bytes_to_serve - bytes_served
-                yield chunk[:remaining]
-                break
+            if not r or not r.bytes: break
+            
+            chunk = r.bytes
+            
+            # Trim Logic (ताकि सही डेटा मिले)
+            if first_chunk_skip > 0:
+                if len(chunk) > first_chunk_skip:
+                    chunk = chunk[first_chunk_skip:]
+                    first_chunk_skip = 0
+                else:
+                    first_chunk_skip -= len(chunk)
+                    offset += len(r.bytes)
+                    continue
+
+            bytes_left = end - (offset + (len(r.bytes) - len(chunk))) + 1
+            if len(chunk) > bytes_left:
+                chunk = chunk[:bytes_left]
+            
+            if not chunk: break
             
             yield chunk
-            bytes_served += chunk_len
             
-            if bytes_served >= total_bytes_to_serve:
-                break
-                
-    except Exception as e:
-        print(f"Stream Error: {e}")
-        # We stop yielding, FastAPI will close the connection.
-        pass
+            offset += len(r.bytes)
+            
+        except Exception as e:
+            print(f"Gen Error: {e}")
+            break
 
-# --- UI HTML Player ---
+# --- UI HTML Player (Final Design) ---
 @app.get("/watch", response_class=HTMLResponse)
 async def watch_video(request: Request, file_id: str, size: int, token: str, exp: int):
     if not verify_token(file_id, token, exp): return "<h1>Invalid/Expired Link</h1>"
@@ -232,3 +264,4 @@ async def download_route(request: Request, file_id: str, size: int, token: str, 
 
 if __name__ == "__main__":
     uvicorn.run(app, host=config.BIND_ADDR, port=config.PORT)
+            
