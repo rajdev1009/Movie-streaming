@@ -9,13 +9,11 @@ from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.responses import StreamingResponse, HTMLResponse
 from pyrogram import Client, filters
 from pyrogram.types import Message
-from pyrogram.raw.functions.upload import GetFile
-from pyrogram.raw.types import InputDocumentFileLocation
-from pyrogram.file_id import FileId
 import uvicorn
 import config
 
 # --- Client Setup ---
+# STABILITY FIX: ipv6=False is crucial for Koyeb/Telegram connection
 client = Client(
     "unified_session",
     api_id=config.API_ID,
@@ -56,10 +54,9 @@ async def video_handler(c: Client, m: Message):
     
     file_size = media.file_size or 1024*1024*10
     
-    # Generate Link to the HTML Page (watch), not direct stream
+    # Generate Link to Watch Page
     watch_link = generate_secure_link(media.file_id, file_size, endpoint="watch")
-    
-    filename = media.file_name or "video.mp4" # Fake name for display
+    filename = media.file_name or "video.mp4"
     
     await m.reply_text(
         f"🎬 **File:** `{filename}`\n"
@@ -92,49 +89,40 @@ class StreamManager:
         async with lock:
             active_streams_count -= 1
 
-# --- Manual Chunk Generator (Stability Fix) ---
-async def file_generator(client: Client, file_id_str: str, start: int, end: int):
+# --- GENERATOR FIX: Back to High-Level API + Range Logic ---
+async def file_generator(client: Client, file_id: str, start: int, end: int):
+    # This method is safer than Raw API because it handles Data Centers (DC) automatically
+    length = end - start + 1
+    current_pos = start
+    
     try:
-        decoded = FileId.decode(file_id_str)
-        media_location = InputDocumentFileLocation(
-            id=decoded.media_id,
-            access_hash=decoded.access_hash,
-            file_reference=decoded.file_reference,
-            thumb_size=""
-        )
-    except Exception:
-        return
+        # We start streaming from the requested offset
+        async for chunk in client.stream_media(file_id, offset=start):
+            if length <= 0:
+                break
+            
+            chunk_len = len(chunk)
+            
+            # If chunk is bigger than needed, cut it
+            if chunk_len > length:
+                yield chunk[:length]
+                length = 0
+                break
+            else:
+                yield chunk
+                length -= chunk_len
+                
+    except Exception as e:
+        print(f"Stream Error: {e}")
+        # Don't crash, just stop streaming
+        pass
 
-    offset = start
-    limit = 1024 * 1024 # 1MB Chunk
-    left = end - start + 1
-
-    while left > 0:
-        chunk_size = min(left, limit)
-        try:
-            r = await client.invoke(
-                GetFile(
-                    location=media_location,
-                    offset=offset,
-                    limit=chunk_size
-                )
-            )
-            chunk = r.bytes
-            if not chunk: break
-            yield chunk
-            offset += len(chunk)
-            left -= len(chunk)
-        except Exception as e:
-            print(f"Error: {e}")
-            break
-
-# --- NEW: HTML Player Endpoint ---
+# --- HTML Player Endpoint ---
 @app.get("/watch", response_class=HTMLResponse)
 async def watch_video(request: Request, file_id: str, size: int, token: str, exp: int):
     if not verify_token(file_id, token, exp):
         return "<h1>Invalid or Expired Link</h1>"
 
-    # Direct stream URL for the player
     stream_url = f"{config.BASE_URL}/stream?file_id={quote(file_id)}&size={size}&token={token}&exp={exp}"
     
     html_content = f"""
@@ -164,13 +152,13 @@ async def watch_video(request: Request, file_id: str, size: int, token: str, exp
             <a href="vlc://{stream_url}" class="btn vlc">Open in VLC Player</a>
             <a href="intent:{stream_url}#Intent;package=com.mxtech.videoplayer.ad;S.title=Video;end" class="btn mx">Open in MX Player</a>
         </div>
-        <p style="color: #777; font-size: 12px; margin-top: 20px;">If video is black/no audio, use VLC button.</p>
+        <p style="color: #777; font-size: 12px; margin-top: 20px;">If screen is black, click 'Open in VLC'.</p>
     </body>
     </html>
     """
     return HTMLResponse(content=html_content)
 
-# --- Stream Endpoint (With Fake MP4 Header) ---
+# --- Stream Endpoint ---
 @app.get("/stream")
 async def stream_route(request: Request, file_id: str, size: int, token: str, exp: int):
     if not verify_token(file_id, token, exp):
@@ -199,8 +187,7 @@ async def stream_route(request: Request, file_id: str, size: int, token: str, ex
         "Content-Range": f"bytes {start}-{end}/{file_size}",
         "Accept-Ranges": "bytes",
         "Content-Length": str(content_length),
-        # FAKE HEADER: Telling browser it is MP4
-        "Content-Type": "video/mp4", 
+        "Content-Type": "video/mp4", # Fake MP4 header for browser compatibility
     }
 
     async def gen():
@@ -214,4 +201,4 @@ async def stream_route(request: Request, file_id: str, size: int, token: str, ex
 
 if __name__ == "__main__":
     uvicorn.run(app, host=config.BIND_ADDR, port=config.PORT)
-        
+    
