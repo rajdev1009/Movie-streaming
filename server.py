@@ -54,7 +54,6 @@ async def video_handler(c: Client, m: Message):
     
     file_size = media.file_size or 1024*1024*10
     
-    # Generate Link to Watch Page
     watch_link = generate_secure_link(media.file_id, file_size, endpoint="watch")
     filename = media.file_name or "video.mp4"
     
@@ -89,21 +88,16 @@ class StreamManager:
         async with lock:
             active_streams_count -= 1
 
-# --- GENERATOR FIX: Back to High-Level API + Range Logic ---
+# --- STREAM GENERATOR (Stable) ---
 async def file_generator(client: Client, file_id: str, start: int, end: int):
-    # This method is safer than Raw API because it handles Data Centers (DC) automatically
     length = end - start + 1
-    current_pos = start
-    
+    # Using standard stream_media with offset. 
+    # ipv6=False in client config prevents the black screen/timeout issues.
     try:
-        # We start streaming from the requested offset
         async for chunk in client.stream_media(file_id, offset=start):
             if length <= 0:
                 break
-            
             chunk_len = len(chunk)
-            
-            # If chunk is bigger than needed, cut it
             if chunk_len > length:
                 yield chunk[:length]
                 length = 0
@@ -111,13 +105,11 @@ async def file_generator(client: Client, file_id: str, start: int, end: int):
             else:
                 yield chunk
                 length -= chunk_len
-                
     except Exception as e:
         print(f"Stream Error: {e}")
-        # Don't crash, just stop streaming
         pass
 
-# --- HTML Player Endpoint ---
+# --- HTML Player Endpoint (UI Fixed) ---
 @app.get("/watch", response_class=HTMLResponse)
 async def watch_video(request: Request, file_id: str, size: int, token: str, exp: int):
     if not verify_token(file_id, token, exp):
@@ -130,29 +122,75 @@ async def watch_video(request: Request, file_id: str, size: int, token: str, exp
     <html>
     <head>
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Stream Player</title>
+        <title>Astra Player</title>
         <style>
-            body {{ background: #0f0f0f; color: white; font-family: sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; }}
-            video {{ width: 100%; max-width: 800px; border-radius: 8px; box-shadow: 0 4px 20px rgba(0,0,0,0.5); background: #000; }}
-            .btn-container {{ margin_top: 20px; display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; }}
-            .btn {{ padding: 10px 20px; border-radius: 5px; text-decoration: none; color: white; font-weight: bold; font-size: 14px; border: none; cursor: pointer; }}
-            .vlc {{ background: #ff5722; }}
-            .mx {{ background: #2196f3; }}
-            h2 {{ margin-bottom: 10px; font-weight: normal; }}
+            body {{ 
+                background: #000000; 
+                margin: 0; 
+                height: 100vh; 
+                display: flex; 
+                flex-direction: column; 
+                justify-content: center; /* Vertically Center */
+                align-items: center; /* Horizontally Center */
+                font-family: sans-serif;
+            }}
+            
+            video {{ 
+                width: 95%; 
+                max-width: 800px; 
+                border-radius: 8px; 
+                background: #000; 
+                box-shadow: 0 0 20px rgba(255,255,255,0.1);
+                max-height: 70vh;
+            }}
+
+            .btn-container {{ 
+                margin-top: 40px; /* Exactly ~1 cm gap */
+                display: flex; 
+                gap: 15px; 
+                flex-wrap: wrap; 
+                justify-content: center; 
+                width: 100%;
+            }}
+
+            .btn {{ 
+                padding: 12px 25px; 
+                border-radius: 50px; 
+                text-decoration: none; 
+                color: white; 
+                font-weight: bold; 
+                font-size: 14px; 
+                border: none; 
+                cursor: pointer; 
+                display: flex;
+                align-items: center;
+                transition: transform 0.2s;
+            }}
+            
+            .btn:active {{ transform: scale(0.95); }}
+            
+            .vlc {{ background: linear-gradient(45deg, #ff5722, #ff9800); }}
+            .playit {{ background: linear-gradient(45deg, #5c3eff, #9e3eff); }}
+            
         </style>
     </head>
     <body>
-        <h2>Now Playing</h2>
+        
         <video controls autoplay playsinline>
             <source src="{stream_url}" type="video/mp4">
             Your browser does not support the video tag.
         </video>
 
         <div class="btn-container">
-            <a href="vlc://{stream_url}" class="btn vlc">Open in VLC Player</a>
-            <a href="intent:{stream_url}#Intent;package=com.mxtech.videoplayer.ad;S.title=Video;end" class="btn mx">Open in MX Player</a>
+            <a href="intent:{stream_url}#Intent;package=org.videolan.vlc;type=video/*;scheme=https;end" class="btn vlc">
+                Open in VLC
+            </a>
+            
+            <a href="intent:{stream_url}#Intent;package=com.playit.videoplayer;type=video/*;scheme=https;end" class="btn playit">
+                Open in Playit
+            </a>
         </div>
-        <p style="color: #777; font-size: 12px; margin-top: 20px;">If screen is black, click 'Open in VLC'.</p>
+
     </body>
     </html>
     """
@@ -187,7 +225,8 @@ async def stream_route(request: Request, file_id: str, size: int, token: str, ex
         "Content-Range": f"bytes {start}-{end}/{file_size}",
         "Accept-Ranges": "bytes",
         "Content-Length": str(content_length),
-        "Content-Type": "video/mp4", # Fake MP4 header for browser compatibility
+        "Content-Type": "video/mp4",
+        "Connection": "keep-alive"
     }
 
     async def gen():
