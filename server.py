@@ -21,13 +21,13 @@ client = Client(
     api_hash=config.API_HASH,
     bot_token=config.BOT_TOKEN,
     in_memory=True,
-    ipv6=False
+    ipv6=False # Stability for Koyeb
 )
 
 app = FastAPI()
 active_streams_count = 0
 lock = asyncio.Lock()
-media_sessions = {} # Cache for DC sessions
+media_sessions = {} # Cache for Multi-DC connections
 
 # --- Helper Functions ---
 def human_size(bytes, units=['B', 'KB', 'MB', 'GB', 'TB']):
@@ -89,48 +89,49 @@ class StreamManager:
         async with lock:
             active_streams_count -= 1
 
-# --- MULTI-DC SESSION MANAGER ---
+# --- MULTI-DC CONNECTION MANAGER (The Fix) ---
 async def get_media_session(client: Client, dc_id: int):
-    """Creates or retrieves a session connected to the specific Data Center"""
+    # If file is on the same DC as bot, use main client
     if dc_id == await client.storage.dc_id():
-        return client # Use main client if DC matches
+        return client
 
+    # Use cached session if available
     if dc_id in media_sessions:
-        return media_sessions[dc_id] # Return cached session
+        return media_sessions[dc_id]
 
-    # Create new session for different DC
-    auth = await Auth(client, dc_id, await client.storage.test_mode()).create()
-    session = Session(
-        client, dc_id, auth, await client.storage.test_mode(), is_media=True
-    )
-    await session.start()
+    try:
+        # Create new connection to the specific DC
+        auth = await Auth(client, dc_id, await client.storage.test_mode()).create()
+        session = Session(
+            client, dc_id, auth, await client.storage.test_mode(), is_media=True
+        )
+        await session.start()
 
-    # Authorize the new session
-    for _ in range(3):
-        try:
-            exported_auth = await client.invoke(
-                raw.functions.auth.ExportAuthorization(dc_id=dc_id)
-            )
-            await session.send(
-                raw.functions.auth.ImportAuthorization(
-                    id=exported_auth.id, bytes=exported_auth.bytes
+        # Copy Authorization from Main Client to New DC
+        for _ in range(3):
+            try:
+                exported_auth = await client.invoke(
+                    raw.functions.auth.ExportAuthorization(dc_id=dc_id)
                 )
-            )
-            break
-        except AuthBytesInvalid:
-            continue
-    else:
-        await session.stop()
-        return None
+                await session.send(
+                    raw.functions.auth.ImportAuthorization(
+                        id=exported_auth.id, bytes=exported_auth.bytes
+                    )
+                )
+                break
+            except AuthBytesInvalid:
+                continue
+        
+        media_sessions[dc_id] = session
+        return session
+    except Exception as e:
+        print(f"DC Connection Failed: {e}")
+        return client # Fallback
 
-    media_sessions[dc_id] = session
-    return session
-
-# --- ROBUST GENERATOR (DC Handling + 4KB Align + Fast Start) ---
+# --- SMART GENERATOR (DC Aware + 4KB Align + Fast Start) ---
 async def file_generator(client: Client, file_id_str: str, start: int, end: int):
     try:
         decoded = FileId.decode(file_id_str)
-        # 1. Get Location Input
         if decoded.file_type == FileType.PHOTO:
             location = raw.types.InputPhotoFileLocation(
                 id=decoded.media_id, access_hash=decoded.access_hash,
@@ -143,37 +144,32 @@ async def file_generator(client: Client, file_id_str: str, start: int, end: int)
             )
     except: return
 
-    # 2. Get Correct DC Session
-    media_session = await get_media_session(client, decoded.dc_id)
-    if not media_session:
-        print(f"Failed to connect to DC {decoded.dc_id}")
-        return
+    # 1. Connect to Correct DC
+    session = await get_media_session(client, decoded.dc_id)
 
-    # 3. Align Offset (4KB Rule)
+    # 2. Align Offset (4KB Rule)
     offset = start - (start % 4096)
     first_chunk_skip = start - offset
     is_first_chunk = True
 
     while offset <= end:
-        # Variable Chunk Size: 1MB Start -> 4MB Speed
+        # Speed: 1MB start, then 4MB
         limit = 1024 * 1024 if is_first_chunk else 1024 * 1024 * 4
         
         try:
-            # Use media_session.send instead of client.invoke for DC support
-            # Use raw GetFile
-            if isinstance(media_session, Client):
-                r = await media_session.invoke(
+            # Request from correct session
+            if isinstance(session, Client):
+                r = await session.invoke(
                     raw.functions.upload.GetFile(location=location, offset=offset, limit=limit)
                 )
             else:
-                r = await media_session.send(
+                r = await session.send(
                     raw.functions.upload.GetFile(location=location, offset=offset, limit=limit)
                 )
 
             if isinstance(r, raw.types.upload.File):
                 chunk = r.bytes
             else:
-                # Handle CDN redirect if happens (rare)
                 break 
 
             if not chunk: break
@@ -200,7 +196,7 @@ async def file_generator(client: Client, file_id_str: str, start: int, end: int)
             is_first_chunk = False
 
         except Exception as e:
-            print(f"Gen Error: {e}")
+            print(f"Stream Error: {e}")
             break
 
 # --- UI HTML Player ---
@@ -210,7 +206,7 @@ async def watch_video(request: Request, file_id: str, size: int, token: str, exp
     stream_url = generate_secure_link(file_id, size, endpoint="stream")
     download_url = generate_secure_link(file_id, size, endpoint="download")
     
-    # UI Variables
+    # Custom Images
     profile_img_url = "https://i.ibb.co/kY1Nyzs/1765464889401-2.jpg"
     random_middle_img = "https://picsum.photos/150/100?grayscale"
     playit_icon_url = "https://cdn-icons-png.flaticon.com/512/0/375.png"
