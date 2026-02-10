@@ -1,165 +1,157 @@
 import time
 import hmac
 import hashlib
-import math
-import mimetypes
-from typing import Generator
 import asyncio
+from urllib.parse import quote
+from typing import Generator
 
 from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.responses import StreamingResponse
-from pyrogram import Client
+from pyrogram import Client, filters, idle
+from pyrogram.types import Message
 from pyrogram.file_id import FileId
 import uvicorn
 import config
 
-# --- Global State ---
-active_streams_count = 0
-lock = asyncio.Lock()
-
-# --- Pyrogram Client for Server ---
-# UPDATE: in_memory=True added to prevent database locks
+# --- Setup Client (Single Instance) ---
+# We use in_memory=True, but since there is only 1 client now, 
+# it won't conflict with anything else.
 client = Client(
-    "server_session",
+    "unified_session",
     api_id=config.API_ID,
     api_hash=config.API_HASH,
     bot_token=config.BOT_TOKEN,
-    no_updates=True,
     in_memory=True
 )
 
 app = FastAPI()
 
+# --- Global State ---
+active_streams_count = 0
+lock = asyncio.Lock()
+
+# ==============================
+#  BOT LOGIC (Handlers)
+# ==============================
+
+def generate_secure_link(file_id: str) -> str:
+    expiry = int(time.time()) + config.TOKEN_EXPIRY
+    payload = f"{file_id}{expiry}".encode()
+    token = hmac.new(config.SECRET_KEY.encode(), payload, hashlib.sha256).hexdigest()
+    return f"{config.BASE_URL}/stream?file_id={quote(file_id)}&token={token}&exp={expiry}"
+
+@client.on_message(filters.command("start"))
+async def start_handler(c: Client, m: Message):
+    await m.reply_text(
+        "**Bot is Online!** (Unified Server) 🟢\n\n"
+        "Send me an MKV file to get a stream link."
+    )
+
+@client.on_message(filters.video | filters.document)
+async def video_handler(c: Client, m: Message):
+    media = m.video or m.document
+    if not media: return
+    
+    link = generate_secure_link(media.file_id)
+    filename = media.file_name or "video.mkv"
+    
+    await m.reply_text(
+        f"**File:** `{filename}`\n\n"
+        f"**Stream Link:**\n`{link}`\n\n"
+        f"__Expires in {config.TOKEN_EXPIRY // 60} mins.__"
+    )
+
+# ==============================
+#  SERVER LOGIC (Streaming)
+# ==============================
+
 @app.on_event("startup")
 async def startup_event():
+    print("Starting Telegram Client...")
     await client.start()
+    print("Client Started!")
 
 @app.on_event("shutdown")
 async def shutdown_event():
+    print("Stopping Telegram Client...")
     await client.stop()
 
-# --- Utilities ---
-
 def verify_token(file_id: str, token: str, expiry: int) -> bool:
-    if time.time() > expiry:
-        return False
-        
+    if time.time() > expiry: return False
     payload = f"{file_id}{expiry}".encode()
-    expected_token = hmac.new(
-        config.SECRET_KEY.encode(),
-        payload,
-        hashlib.sha256
-    ).hexdigest()
-    
-    return hmac.compare_digest(expected_token, token)
+    expected = hmac.new(config.SECRET_KEY.encode(), payload, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, token)
 
 class StreamManager:
-    """Context manager to handle concurrent stream limits."""
     async def __aenter__(self):
         global active_streams_count
         async with lock:
             if active_streams_count >= config.MAX_CONCURRENT_STREAMS:
-                raise HTTPException(status_code=503, detail="Server busy: Max streams reached.")
+                raise HTTPException(503, "Server busy")
             active_streams_count += 1
         return self
-
-    async def __aexit__(self, exc_type, exc, tb):
+    async def __aexit__(self, *args):
         global active_streams_count
         async with lock:
             active_streams_count -= 1
 
-async def telegram_file_generator(
-    client: Client, 
-    file_id_str: str, 
-    start_byte: int, 
-    end_byte: int, 
-    chunk_size: int = 1024 * 1024
-):
-    current_offset = start_byte
-    remaining_bytes = end_byte - start_byte + 1
+async def file_generator(client: Client, file_id: str, start: int, end: int):
+    chunk_size = 1024 * 1024
+    offset = start
+    left = end - start + 1
     
-    while remaining_bytes > 0:
-        fetch_size = min(chunk_size, remaining_bytes)
-        
-        async for chunk in client.stream_media(
-            file_id_str,
-            offset=current_offset,
-            limit=fetch_size
-        ):
-            if not chunk:
-                break
+    while left > 0:
+        fetch = min(chunk_size, left)
+        async for chunk in client.stream_media(file_id, offset=offset, limit=fetch):
+            if not chunk: break
             yield chunk
-            chunk_len = len(chunk)
-            current_offset += chunk_len
-            remaining_bytes -= chunk_len
-            
-            if remaining_bytes <= 0:
-                break
+            offset += len(chunk)
+            left -= len(chunk)
+            if left <= 0: break
 
 @app.get("/stream")
-async def stream_video(
-    request: Request,
-    file_id: str,
-    token: str,
-    exp: int
-):
-    # 1. Security Checks
+async def stream_route(request: Request, file_id: str, token: str, exp: int):
     if not verify_token(file_id, token, exp):
-        raise HTTPException(status_code=403, detail="Invalid or Expired Token")
-
-    # 2. Get File Info
+        raise HTTPException(403, "Invalid/Expired Token")
+    
     try:
-        decoded_file = FileId.decode(file_id)
-        file_size = decoded_file.file_size
-        mime_type = "video/x-matroska"
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid File ID")
+        f_info = FileId.decode(file_id)
+        file_size = f_info.file_size
+    except:
+        raise HTTPException(400, "Invalid File ID")
 
-    # 3. Handle Range Header
     range_header = request.headers.get("range")
-    start = 0
-    end = file_size - 1
+    start, end = 0, file_size - 1
     
     if range_header:
         try:
-            unit, ranges = range_header.split("=")
+            unit, r = range_header.split("=")
             if unit == "bytes":
-                parts = ranges.split("-")
+                parts = r.split("-")
                 start = int(parts[0]) if parts[0] else 0
                 end = int(parts[1]) if len(parts) > 1 and parts[1] else file_size - 1
-        except ValueError:
-            pass
+        except: pass
 
     if start >= file_size:
         return Response(status_code=416, headers={"Content-Range": f"bytes */{file_size}"})
-    
-    end = min(end, file_size - 1)
-    content_length = end - start + 1
 
+    end = min(end, file_size - 1)
+    
     headers = {
         "Content-Range": f"bytes {start}-{end}/{file_size}",
         "Accept-Ranges": "bytes",
-        "Content-Length": str(content_length),
-        "Content-Type": mime_type,
-        "Content-Disposition": "inline"
+        "Content-Length": str(end - start + 1),
+        "Content-Type": "video/x-matroska",
     }
 
-    async def protected_generator():
+    async def gen():
         try:
             async with StreamManager():
-                async for chunk in telegram_file_generator(client, file_id, start, end):
+                async for chunk in file_generator(client, file_id, start, end):
                     yield chunk
-        except HTTPException:
-            pass
-        except Exception as e:
-            print(f"Streaming error: {e}")
-            pass
+        except: pass
 
-    return StreamingResponse(
-        protected_generator(),
-        status_code=206,
-        headers=headers
-    )
+    return StreamingResponse(gen(), status_code=206, headers=headers)
 
 if __name__ == "__main__":
     uvicorn.run(app, host=config.BIND_ADDR, port=config.PORT)
