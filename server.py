@@ -6,11 +6,9 @@ from urllib.parse import quote
 
 from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.responses import StreamingResponse, HTMLResponse
-from pyrogram import Client, filters, raw
+from pyrogram import Client, filters
 from pyrogram.types import Message
-from pyrogram.session import Session, Auth
-from pyrogram.errors import AuthBytesInvalid
-from pyrogram.file_id import FileId, FileType, ThumbnailSource
+from pyrogram.file_id import FileId
 import uvicorn
 import config
 
@@ -21,13 +19,13 @@ client = Client(
     api_hash=config.API_HASH,
     bot_token=config.BOT_TOKEN,
     in_memory=True,
-    ipv6=False # Stability for Koyeb
+    ipv6=False, # Stability for Koyeb
+    workers=4   # Better performance
 )
 
 app = FastAPI()
 active_streams_count = 0
 lock = asyncio.Lock()
-media_sessions = {} # Cache for Multi-DC connections
 
 # --- Helper Functions ---
 def human_size(bytes, units=['B', 'KB', 'MB', 'GB', 'TB']):
@@ -89,115 +87,35 @@ class StreamManager:
         async with lock:
             active_streams_count -= 1
 
-# --- MULTI-DC CONNECTION MANAGER (The Fix) ---
-async def get_media_session(client: Client, dc_id: int):
-    # If file is on the same DC as bot, use main client
-    if dc_id == await client.storage.dc_id():
-        return client
-
-    # Use cached session if available
-    if dc_id in media_sessions:
-        return media_sessions[dc_id]
-
-    try:
-        # Create new connection to the specific DC
-        auth = await Auth(client, dc_id, await client.storage.test_mode()).create()
-        session = Session(
-            client, dc_id, auth, await client.storage.test_mode(), is_media=True
-        )
-        await session.start()
-
-        # Copy Authorization from Main Client to New DC
-        for _ in range(3):
-            try:
-                exported_auth = await client.invoke(
-                    raw.functions.auth.ExportAuthorization(dc_id=dc_id)
-                )
-                await session.send(
-                    raw.functions.auth.ImportAuthorization(
-                        id=exported_auth.id, bytes=exported_auth.bytes
-                    )
-                )
-                break
-            except AuthBytesInvalid:
-                continue
-        
-        media_sessions[dc_id] = session
-        return session
-    except Exception as e:
-        print(f"DC Connection Failed: {e}")
-        return client # Fallback
-
-# --- SMART GENERATOR (DC Aware + 4KB Align + Fast Start) ---
+# --- NATIVE GENERATOR (The Fix) ---
+# We use Pyrogram's internal stream_media to handle DC switching automatically
 async def file_generator(client: Client, file_id_str: str, start: int, end: int):
+    # Calculate total bytes to fetch
+    total_bytes_to_serve = end - start + 1
+    bytes_served = 0
+    
     try:
-        decoded = FileId.decode(file_id_str)
-        if decoded.file_type == FileType.PHOTO:
-            location = raw.types.InputPhotoFileLocation(
-                id=decoded.media_id, access_hash=decoded.access_hash,
-                file_reference=decoded.file_reference, thumb_size=decoded.thumbnail_size
-            )
-        else:
-            location = raw.types.InputDocumentFileLocation(
-                id=decoded.media_id, access_hash=decoded.access_hash,
-                file_reference=decoded.file_reference, thumb_size=decoded.thumbnail_size
-            )
-    except: return
-
-    # 1. Connect to Correct DC
-    session = await get_media_session(client, decoded.dc_id)
-
-    # 2. Align Offset (4KB Rule)
-    offset = start - (start % 4096)
-    first_chunk_skip = start - offset
-    is_first_chunk = True
-
-    while offset <= end:
-        # Speed: 1MB start, then 4MB
-        limit = 1024 * 1024 if is_first_chunk else 1024 * 1024 * 4
-        
-        try:
-            # Request from correct session
-            if isinstance(session, Client):
-                r = await session.invoke(
-                    raw.functions.upload.GetFile(location=location, offset=offset, limit=limit)
-                )
-            else:
-                r = await session.send(
-                    raw.functions.upload.GetFile(location=location, offset=offset, limit=limit)
-                )
-
-            if isinstance(r, raw.types.upload.File):
-                chunk = r.bytes
-            else:
-                break 
-
-            if not chunk: break
-
-            # Trim logic
-            if first_chunk_skip > 0:
-                if len(chunk) > first_chunk_skip:
-                    chunk = chunk[first_chunk_skip:]
-                    first_chunk_skip = 0
-                else:
-                    first_chunk_skip -= len(chunk)
-                    offset += len(chunk)
-                    is_first_chunk = False
-                    continue
-
-            bytes_left = end - (offset + (len(r.bytes) - len(chunk))) + 1
-            if len(chunk) > bytes_left:
-                chunk = chunk[:bytes_left]
+        # We ask Pyrogram to start streaming from the requested 'start' byte.
+        # It handles encryption, DC migration (FILE_MIGRATE), and chunking internally.
+        async for chunk in client.stream_media(file_id_str, offset=start):
+            chunk_len = len(chunk)
             
-            if not chunk: break
+            # If this chunk contains more data than needed to reach 'end', trim it
+            if bytes_served + chunk_len > total_bytes_to_serve:
+                remaining = total_bytes_to_serve - bytes_served
+                yield chunk[:remaining]
+                break
+            
             yield chunk
+            bytes_served += chunk_len
             
-            offset += len(r.bytes)
-            is_first_chunk = False
-
-        except Exception as e:
-            print(f"Stream Error: {e}")
-            break
+            if bytes_served >= total_bytes_to_serve:
+                break
+                
+    except Exception as e:
+        print(f"Stream Error: {e}")
+        # We stop yielding, FastAPI will close the connection.
+        pass
 
 # --- UI HTML Player ---
 @app.get("/watch", response_class=HTMLResponse)
@@ -206,7 +124,7 @@ async def watch_video(request: Request, file_id: str, size: int, token: str, exp
     stream_url = generate_secure_link(file_id, size, endpoint="stream")
     download_url = generate_secure_link(file_id, size, endpoint="download")
     
-    # Custom Images
+    # UI Assets
     profile_img_url = "https://i.ibb.co/kY1Nyzs/1765464889401-2.jpg"
     random_middle_img = "https://picsum.photos/150/100?grayscale"
     playit_icon_url = "https://cdn-icons-png.flaticon.com/512/0/375.png"
@@ -314,4 +232,3 @@ async def download_route(request: Request, file_id: str, size: int, token: str, 
 
 if __name__ == "__main__":
     uvicorn.run(app, host=config.BIND_ADDR, port=config.PORT)
-    
