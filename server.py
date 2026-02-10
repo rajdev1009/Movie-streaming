@@ -9,7 +9,6 @@ from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.responses import StreamingResponse
 from pyrogram import Client, filters, idle
 from pyrogram.types import Message
-from pyrogram.file_id import FileId
 import uvicorn
 import config
 
@@ -29,11 +28,13 @@ active_streams_count = 0
 lock = asyncio.Lock()
 
 # --- Helper Functions ---
-def generate_secure_link(file_id: str) -> str:
+# UPDATE: Added file_size to the link generation
+def generate_secure_link(file_id: str, file_size: int) -> str:
     expiry = int(time.time()) + config.TOKEN_EXPIRY
     payload = f"{file_id}{expiry}".encode()
     token = hmac.new(config.SECRET_KEY.encode(), payload, hashlib.sha256).hexdigest()
-    return f"{config.BASE_URL}/stream?file_id={quote(file_id)}&token={token}&exp={expiry}"
+    # Link now includes &size=...
+    return f"{config.BASE_URL}/stream?file_id={quote(file_id)}&size={file_size}&token={token}&exp={expiry}"
 
 def verify_token(file_id: str, token: str, expiry: int) -> bool:
     if time.time() > expiry: return False
@@ -51,12 +52,15 @@ async def video_handler(c: Client, m: Message):
     media = m.video or m.document
     if not media: return
     
-    link = generate_secure_link(media.file_id)
+    # UPDATE: We get file_size directly from the message
+    file_size = media.file_size or 1024*1024*100 # Default fallback
+    
+    link = generate_secure_link(media.file_id, file_size)
     filename = media.file_name or "video.mkv"
     
-    # Note: Link is NOT in backticks now, so it will be clickable
     await m.reply_text(
-        f"🎬 **File:** `{filename}`\n\n"
+        f"🎬 **File:** `{filename}`\n"
+        f"📦 **Size:** `{round(file_size / (1024*1024), 2)} MB`\n\n"
         f"🔗 **Stream Link:**\n{link}\n\n"
         f"⚠️ Expires in {config.TOKEN_EXPIRY // 60} mins."
     )
@@ -98,16 +102,14 @@ async def file_generator(client: Client, file_id: str, start: int, end: int):
             left -= len(chunk)
             if left <= 0: break
 
+# UPDATE: Added 'size' parameter to the route
 @app.get("/stream")
-async def stream_route(request: Request, file_id: str, token: str, exp: int):
+async def stream_route(request: Request, file_id: str, size: int, token: str, exp: int):
     if not verify_token(file_id, token, exp):
         raise HTTPException(403, "Invalid/Expired Token")
     
-    try:
-        f_info = FileId.decode(file_id)
-        file_size = f_info.file_size
-    except:
-        raise HTTPException(400, "Invalid File ID")
+    # UPDATE: No decoding needed! We trust the size from the link.
+    file_size = size
 
     range_header = request.headers.get("range")
     start, end = 0, file_size - 1
