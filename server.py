@@ -9,11 +9,13 @@ from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.responses import StreamingResponse
 from pyrogram import Client, filters
 from pyrogram.types import Message
+from pyrogram.raw.functions.upload import GetFile
+from pyrogram.raw.types import InputFileLocation, InputDocumentFileLocation
+from pyrogram.file_id import FileId
 import uvicorn
 import config
 
 # --- Client Setup ---
-# ipv6=False is important for stability on Koyeb
 client = Client(
     "unified_session",
     api_id=config.API_ID,
@@ -29,7 +31,7 @@ app = FastAPI()
 active_streams_count = 0
 lock = asyncio.Lock()
 
-# --- Security & Links ---
+# --- Security ---
 def generate_secure_link(file_id: str, file_size: int) -> str:
     expiry = int(time.time()) + config.TOKEN_EXPIRY
     payload = f"{file_id}{expiry}".encode()
@@ -87,34 +89,48 @@ class StreamManager:
         async with lock:
             active_streams_count -= 1
 
-# --- CORE FIX: Manual Chunk Generator ---
-async def file_generator(client: Client, file_id: str, start: int, end: int):
-    offset = start
-    total_to_fetch = end - start + 1
-    chunk_size = 1024 * 1024  # 1 MB Request Block
+# --- CORE FIX: Use RAW GetFile for Stability ---
+async def file_generator(client: Client, file_id_str: str, start: int, end: int):
+    # Decode FileID to get RAW Location
+    try:
+        decoded = FileId.decode(file_id_str)
+        media_location = InputDocumentFileLocation(
+            id=decoded.media_id,
+            access_hash=decoded.access_hash,
+            file_reference=decoded.file_reference,
+            thumb_size=""
+        )
+    except Exception:
+        # Fallback if decoding fails (rare)
+        return
 
-    # Loop until we fetch all requested bytes
-    while total_to_fetch > 0:
-        # Calculate how much to fetch in this iteration (max 1MB)
-        current_fetch_limit = min(total_to_fetch, chunk_size)
-        
+    offset = start
+    limit = 1024 * 1024 # 1MB Chunk
+    left = end - start + 1
+
+    while left > 0:
+        chunk_size = min(left, limit)
         try:
-            # We create a FRESH iterator for every 1MB block.
-            # This prevents Pyrogram's internal offset tracking from getting corrupted.
-            async for chunk in client.stream_media(file_id, offset=offset, limit=current_fetch_limit):
-                if not chunk:
-                    break
-                yield chunk
+            # Direct RAW call to Telegram API (Bypasses Pyrogram's stream logic)
+            r = await client.invoke(
+                GetFile(
+                    location=media_location,
+                    offset=offset,
+                    limit=chunk_size
+                )
+            )
+            
+            chunk = r.bytes
+            if not chunk:
+                break
                 
-                # Manually update tracking
-                chunk_len = len(chunk)
-                offset += chunk_len
-                total_to_fetch -= chunk_len
-                
-                if total_to_fetch <= 0:
-                    break
+            yield chunk
+            
+            offset += len(chunk)
+            left -= len(chunk)
+
         except Exception as e:
-            print(f"Stream Error at offset {offset}: {e}")
+            print(f"Error at offset {offset}: {e}")
             break
 
 @app.get("/stream")
