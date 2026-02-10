@@ -6,11 +6,11 @@ from urllib.parse import quote
 
 from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.responses import StreamingResponse, HTMLResponse
-from pyrogram import Client, filters
+from pyrogram import Client, filters, raw
 from pyrogram.types import Message
-from pyrogram.raw.functions.upload import GetFile
-from pyrogram.raw.types import InputDocumentFileLocation
-from pyrogram.file_id import FileId
+from pyrogram.session import Session, Auth
+from pyrogram.errors import AuthBytesInvalid
+from pyrogram.file_id import FileId, FileType, ThumbnailSource
 import uvicorn
 import config
 
@@ -21,12 +21,13 @@ client = Client(
     api_hash=config.API_HASH,
     bot_token=config.BOT_TOKEN,
     in_memory=True,
-    ipv6=False 
+    ipv6=False
 )
 
 app = FastAPI()
 active_streams_count = 0
 lock = asyncio.Lock()
+media_sessions = {} # Cache for DC sessions
 
 # --- Helper Functions ---
 def human_size(bytes, units=['B', 'KB', 'MB', 'GB', 'TB']):
@@ -36,7 +37,7 @@ def human_size(bytes, units=['B', 'KB', 'MB', 'GB', 'TB']):
         bytes /= 1024
     return f"{bytes:.2f} {units[-1]}"
 
-def generate_secure_link(file_id: str, file_size: int, endpoint: str = "watch") -> str:
+def generate_secure_link(file_id: str, file_size: int, endpoint: str) -> str:
     expiry = int(time.time()) + config.TOKEN_EXPIRY
     payload = f"{file_id}{expiry}".encode()
     token = hmac.new(config.SECRET_KEY.encode(), payload, hashlib.sha256).hexdigest()
@@ -51,7 +52,7 @@ def verify_token(file_id: str, token: str, expiry: int) -> bool:
 # --- Bot Handlers ---
 @client.on_message(filters.command("start"))
 async def start_handler(c: Client, m: Message):
-    await m.reply_text("✅ **Bot Online!**\nSend MKV file.")
+    await m.reply_text("✅ **Bot Online!**\nSend me a video file.")
 
 @client.on_message(filters.video | filters.document)
 async def video_handler(c: Client, m: Message):
@@ -61,7 +62,7 @@ async def video_handler(c: Client, m: Message):
     watch_link = generate_secure_link(media.file_id, file_size, endpoint="watch")
     filename = media.file_name or "video.mp4"
     await m.reply_text(
-        f"🎬 **File:** `{filename}`\n📦 **Size:** `{human_size(file_size)}`\n\n▶️ **Click to Watch:**\n{watch_link}\n\n⚠️ Expires in {config.TOKEN_EXPIRY // 60} mins."
+        f"🎬 **File:** `{filename}`\n📦 **Size:** `{human_size(file_size)}`\n\n▶️ **Click to Watch / Download:**\n{watch_link}\n\n⚠️ Expires in {config.TOKEN_EXPIRY // 60} mins."
     )
 
 # --- Server Logic ---
@@ -88,107 +89,192 @@ class StreamManager:
         async with lock:
             active_streams_count -= 1
 
-# --- THE REAL FIX: 4KB Aligned Generator ---
+# --- MULTI-DC SESSION MANAGER ---
+async def get_media_session(client: Client, dc_id: int):
+    """Creates or retrieves a session connected to the specific Data Center"""
+    if dc_id == await client.storage.dc_id():
+        return client # Use main client if DC matches
+
+    if dc_id in media_sessions:
+        return media_sessions[dc_id] # Return cached session
+
+    # Create new session for different DC
+    auth = await Auth(client, dc_id, await client.storage.test_mode()).create()
+    session = Session(
+        client, dc_id, auth, await client.storage.test_mode(), is_media=True
+    )
+    await session.start()
+
+    # Authorize the new session
+    for _ in range(3):
+        try:
+            exported_auth = await client.invoke(
+                raw.functions.auth.ExportAuthorization(dc_id=dc_id)
+            )
+            await session.send(
+                raw.functions.auth.ImportAuthorization(
+                    id=exported_auth.id, bytes=exported_auth.bytes
+                )
+            )
+            break
+        except AuthBytesInvalid:
+            continue
+    else:
+        await session.stop()
+        return None
+
+    media_sessions[dc_id] = session
+    return session
+
+# --- ROBUST GENERATOR (DC Handling + 4KB Align + Fast Start) ---
 async def file_generator(client: Client, file_id_str: str, start: int, end: int):
     try:
         decoded = FileId.decode(file_id_str)
-        location = InputDocumentFileLocation(
-            id=decoded.media_id,
-            access_hash=decoded.access_hash,
-            file_reference=decoded.file_reference,
-            thumb_size=""
-        )
+        # 1. Get Location Input
+        if decoded.file_type == FileType.PHOTO:
+            location = raw.types.InputPhotoFileLocation(
+                id=decoded.media_id, access_hash=decoded.access_hash,
+                file_reference=decoded.file_reference, thumb_size=decoded.thumbnail_size
+            )
+        else:
+            location = raw.types.InputDocumentFileLocation(
+                id=decoded.media_id, access_hash=decoded.access_hash,
+                file_reference=decoded.file_reference, thumb_size=decoded.thumbnail_size
+            )
     except: return
 
-    # 1. Align the Start Offset to 4KB (Telegram Requirement)
-    # If start is 4097, aligned_start becomes 4096.
-    offset = start - (start % 4096) 
-    
-    # 2. Calculate how many bytes to skip initially
+    # 2. Get Correct DC Session
+    media_session = await get_media_session(client, decoded.dc_id)
+    if not media_session:
+        print(f"Failed to connect to DC {decoded.dc_id}")
+        return
+
+    # 3. Align Offset (4KB Rule)
+    offset = start - (start % 4096)
     first_chunk_skip = start - offset
-    
-    # 3. Always request 1MB chunks
-    limit = 1024 * 1024 
-    
+    is_first_chunk = True
+
     while offset <= end:
+        # Variable Chunk Size: 1MB Start -> 4MB Speed
+        limit = 1024 * 1024 if is_first_chunk else 1024 * 1024 * 4
+        
         try:
-            r = await client.invoke(
-                GetFile(
-                    location=location,
-                    offset=offset,
-                    limit=limit 
+            # Use media_session.send instead of client.invoke for DC support
+            # Use raw GetFile
+            if isinstance(media_session, Client):
+                r = await media_session.invoke(
+                    raw.functions.upload.GetFile(location=location, offset=offset, limit=limit)
                 )
-            )
-            
-            if not r or not r.bytes: break
-            
-            chunk = r.bytes
-            
-            # 4. If this is the first chunk, skip the unneeded bytes
+            else:
+                r = await media_session.send(
+                    raw.functions.upload.GetFile(location=location, offset=offset, limit=limit)
+                )
+
+            if isinstance(r, raw.types.upload.File):
+                chunk = r.bytes
+            else:
+                # Handle CDN redirect if happens (rare)
+                break 
+
+            if not chunk: break
+
+            # Trim logic
             if first_chunk_skip > 0:
                 if len(chunk) > first_chunk_skip:
                     chunk = chunk[first_chunk_skip:]
                     first_chunk_skip = 0
                 else:
-                    # If chunk is smaller than skip (rare), skip all and continue
                     first_chunk_skip -= len(chunk)
-                    offset += len(r.bytes)
+                    offset += len(chunk)
+                    is_first_chunk = False
                     continue
 
-            # 5. Trim the end if we fetched more than needed
             bytes_left = end - (offset + (len(r.bytes) - len(chunk))) + 1
             if len(chunk) > bytes_left:
                 chunk = chunk[:bytes_left]
             
             if not chunk: break
-            
             yield chunk
             
-            # Update offset based on RAW bytes received from Telegram (not the cut chunk)
             offset += len(r.bytes)
-            
+            is_first_chunk = False
+
         except Exception as e:
             print(f"Gen Error: {e}")
             break
 
-# --- HTML Player ---
+# --- UI HTML Player ---
 @app.get("/watch", response_class=HTMLResponse)
 async def watch_video(request: Request, file_id: str, size: int, token: str, exp: int):
-    if not verify_token(file_id, token, exp): return "<h1>Invalid/Expired</h1>"
-    stream_url = f"{config.BASE_URL}/stream?file_id={quote(file_id)}&size={size}&token={token}&exp={exp}"
+    if not verify_token(file_id, token, exp): return "<h1>Invalid/Expired Link</h1>"
+    stream_url = generate_secure_link(file_id, size, endpoint="stream")
+    download_url = generate_secure_link(file_id, size, endpoint="download")
     
+    # UI Variables
+    profile_img_url = "https://i.ibb.co/kY1Nyzs/1765464889401-2.jpg"
+    random_middle_img = "https://picsum.photos/150/100?grayscale"
+    playit_icon_url = "https://cdn-icons-png.flaticon.com/512/0/375.png"
+
     html_content = f"""
     <!DOCTYPE html>
-    <html>
+    <html lang="en">
     <head>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Astra Player</title>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Raj_hd_movies Player</title>
         <style>
-            body {{ background: #000; margin: 0; height: 100vh; display: flex; flex-direction: column; justify-content: center; align-items: center; font-family: sans-serif; }}
-            video {{ width: 95%; max-width: 800px; border-radius: 8px; background: #000; box-shadow: 0 0 20px rgba(255,255,255,0.1); }}
-            .btn-container {{ margin-top: 40px; display: flex; gap: 15px; flex-wrap: wrap; justify-content: center; width: 100%; }}
-            .btn {{ padding: 12px 25px; border-radius: 50px; text-decoration: none; color: white; font-weight: bold; font-size: 14px; border: none; cursor: pointer; display: flex; align-items: center; background: #333; }}
-            .vlc {{ background: linear-gradient(45deg, #ff5722, #ff9800); }}
-            .playit {{ background: linear-gradient(45deg, #5c3eff, #9e3eff); }}
+            body {{ background-color: #000; color: #fff; font-family: sans-serif; display: flex; flex-direction: column; align-items: center; margin: 0; padding: 20px 10px; text-align: center; min-height: 100vh; box-sizing: border-box; }}
+            .header-title {{ font-size: 3.5em; font-family: "Brush Script MT", cursive, sans-serif; margin-bottom: 5px; line-height: 1.2; }}
+            .sub-title {{ color: #888; font-size: 1em; margin-bottom: 25px; }}
+            .profile-img {{ width: 90px; height: 90px; border-radius: 50%; object-fit: cover; margin-bottom: 25px; border: 2px solid #222; }}
+            video {{ width: 100%; max-width: 800px; aspect-ratio: 16 / 9; border-radius: 8px; margin-bottom: 25px; background: #111; box-shadow: 0 4px 15px rgba(255,255,255,0.1); }}
+            .channel-name {{ font-size: 2.8em; font-weight: bold; margin-bottom: 35px; letter-spacing: 1px; }}
+            .players-row {{ display: flex; justify-content: space-between; align-items: center; width: 100%; max-width: 600px; margin: 0 auto 40px auto; padding: 0 10px; box-sizing: border-box; }}
+            .player-link {{ text-decoration: none; color: white; font-size: 2.2em; font-weight: bold; display: flex; align-items: center; }}
+            .playit-icon-img {{ width: 35px; height: 35px; margin-right: 10px; filter: brightness(0) saturate(100%) invert(63%) sepia(68%) saturate(450%) hue-rotate(346deg) brightness(101%) contrast(101%); }}
+            .middle-img-container {{ flex-grow: 1; display: flex; justify-content: center; padding: 0 15px; }}
+            .middle-img {{ width: 100%; max-width: 140px; height: auto; border-radius: 6px; object-fit: cover; opacity: 0.8; }}
+            .download-btn {{ background: linear-gradient(to bottom, #53e03d, #3ab028); border: 2px solid #2ecc71; border-radius: 12px; padding: 12px 25px; display: flex; align-items: center; justify-content: space-between; text-decoration: none; color: white; width: 90%; max-width: 380px; margin-bottom: 50px; box-shadow: 0 6px 15px rgba(76, 209, 55, 0.4); transition: transform 0.1s; }}
+            .download-btn:active {{ transform: scale(0.98); }}
+            .dl-arrow-left {{ font-size: 2.5em; margin-right: 15px; font-weight: bold; color: #dfffce; text-shadow: 0 2px 2px rgba(0,0,0,0.2); }}
+            .dl-text-container {{ text-align: left; flex-grow: 1; }}
+            .dl-small {{ font-size: 1em; display: block; opacity: 0.9; }}
+            .dl-big {{ font-size: 1.6em; font-weight: 900; display: block; text-transform: uppercase; }}
+            .dl-icon-right {{ font-size: 1.8em; margin-left: 15px; }}
+            .footer-text {{ font-weight: bold; margin-bottom: 15px; font-size: 1.2em; }}
+            @media (max-width: 400px) {{ .header-title {{ font-size: 2.8em; }} .channel-name {{ font-size: 2.2em; }} .player-link {{ font-size: 1.8em; }} .middle-img {{ max-width: 100px; }} }}
         </style>
     </head>
     <body>
+        <div class="header-title">Raj_hd_movies</div>
+        <div class="sub-title">powered by Rajdev</div>
+        <img src="{profile_img_url}" alt="Profile" class="profile-img">
         <video controls autoplay playsinline>
             <source src="{stream_url}" type="video/mp4">
             Your browser does not support the video tag.
         </video>
-        <div class="btn-container">
-            <a href="intent:{stream_url}#Intent;package=org.videolan.vlc;type=video/*;scheme=https;end" class="btn vlc">Open in VLC</a>
-            <a href="intent:{stream_url}#Intent;package=com.playit.videoplayer;type=video/*;scheme=https;end" class="btn playit">Open in Playit</a>
+        <div class="channel-name">AstraToonix</div>
+        <div class="players-row">
+            <a href="intent:{stream_url}#Intent;package=com.playit.videoplayer;type=video/*;scheme=https;end" class="player-link">
+                <img src="{playit_icon_url}" alt="play" class="playit-icon-img">
+                <span>playit</span>
+            </a>
+            <div class="middle-img-container"><img src="{random_middle_img}" alt="Random" class="middle-img"></div>
+            <a href="intent:{stream_url}#Intent;package=org.videolan.vlc;type=video/*;scheme=https;end" class="player-link"><span>vlc</span></a>
         </div>
+        <a href="{download_url}" class="download-btn">
+            <div class="dl-arrow-left">≫</div>
+            <div class="dl-text-container"><span class="dl-small">Click here to</span><span class="dl-big">DOWNLOAD</span></div>
+            <div class="dl-icon-right">📥</div>
+        </a>
+        <div class="footer-text">powered by Rajdev</div>
+        <div class="footer-text">ram ram</div>
     </body>
     </html>
     """
     return HTMLResponse(content=html_content)
 
-@app.get("/stream")
-async def stream_route(request: Request, file_id: str, size: int, token: str, exp: int):
-    if not verify_token(file_id, token, exp): raise HTTPException(403, "Invalid/Expired Token")
+async def stream_logic(request: Request, file_id: str, size: int, disposition: str):
     file_size = size
     range_header = request.headers.get("range")
     start, end = 0, file_size - 1
@@ -200,7 +286,7 @@ async def stream_route(request: Request, file_id: str, size: int, token: str, ex
                 start = int(parts[0]) if parts[0] else 0
                 end = int(parts[1]) if len(parts) > 1 and parts[1] else file_size - 1
         except: pass
-    
+
     if start >= file_size: return Response(status_code=416, headers={"Content-Range": f"bytes */{file_size}"})
     end = min(end, file_size - 1)
     content_length = end - start + 1
@@ -209,6 +295,7 @@ async def stream_route(request: Request, file_id: str, size: int, token: str, ex
         "Accept-Ranges": "bytes",
         "Content-Length": str(content_length),
         "Content-Type": "video/mp4",
+        "Content-Disposition": disposition,
         "Connection": "keep-alive"
     }
     async def gen():
@@ -218,6 +305,16 @@ async def stream_route(request: Request, file_id: str, size: int, token: str, ex
                     yield chunk
         except: pass
     return StreamingResponse(gen(), status_code=206, headers=headers)
+
+@app.get("/stream")
+async def stream_route(request: Request, file_id: str, size: int, token: str, exp: int):
+    if not verify_token(file_id, token, exp): raise HTTPException(403, "Invalid Token")
+    return await stream_logic(request, file_id, size, "inline")
+
+@app.get("/download")
+async def download_route(request: Request, file_id: str, size: int, token: str, exp: int):
+    if not verify_token(file_id, token, exp): raise HTTPException(403, "Invalid Token")
+    return await stream_logic(request, file_id, size, "attachment")
 
 if __name__ == "__main__":
     uvicorn.run(app, host=config.BIND_ADDR, port=config.PORT)
