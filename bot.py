@@ -31,12 +31,26 @@ def generate_secure_link(file_id: str) -> str:
     # Construct URL
     return f"{config.BASE_URL}/stream?file_id={quote(file_id)}&token={token}&exp={expiry}"
 
+# --- NEW: Start Command Handler ---
+@app.on_message(filters.command("start"))
+async def start_handler(client: Client, message: Message):
+    await message.reply_text(
+        "**Bot is Online!** 🟢\n\n"
+        "मुझे कोई भी MKV या वीडियो फाइल फॉरवर्ड करें, "
+        "और मैं आपको उसका स्ट्रीमिंग लिंक दूंगा।"
+    )
+
 @app.on_message(filters.video | filters.document)
 async def handle_video(client: Client, message: Message):
     media = message.video or message.document
     if not media:
         return
     
+    # Check if it's actually a video (mime_type check optional but good)
+    if hasattr(media, "mime_type") and media.mime_type and "video" not in media.mime_type:
+        # Document ho sakta hai par video nahi
+        pass 
+
     file_id = media.file_id
     file_name = media.file_name or "video.mkv"
     
