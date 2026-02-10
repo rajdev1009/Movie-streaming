@@ -18,14 +18,14 @@ active_streams_count = 0
 lock = asyncio.Lock()
 
 # --- Pyrogram Client for Server ---
-# Note: In production, passing a session string is better, 
-# but for simplicity we use the same bot token logic.
+# UPDATE: in_memory=True added to prevent database locks
 client = Client(
     "server_session",
     api_id=config.API_ID,
     api_hash=config.API_HASH,
     bot_token=config.BOT_TOKEN,
-    no_updates=True  # Server doesn't need to listen to updates
+    no_updates=True,
+    in_memory=True
 )
 
 app = FastAPI()
@@ -73,20 +73,13 @@ async def telegram_file_generator(
     file_id_str: str, 
     start_byte: int, 
     end_byte: int, 
-    chunk_size: int = 1024 * 1024  # 1MB chunks
+    chunk_size: int = 1024 * 1024
 ):
-    """Generates file chunks from Telegram without downloading the whole file."""
-    
-    # We yield chunks until we reach the end of the requested range
     current_offset = start_byte
     remaining_bytes = end_byte - start_byte + 1
     
     while remaining_bytes > 0:
         fetch_size = min(chunk_size, remaining_bytes)
-        
-        # Pyrogram's stream_media or iter_download can be used.
-        # Here we use a precise chunk fetcher using iter_download with offset.
-        # Note: iter_download yields chunks. We calculate which chunk index implies which offset.
         
         async for chunk in client.stream_media(
             file_id_str,
@@ -114,13 +107,11 @@ async def stream_video(
     if not verify_token(file_id, token, exp):
         raise HTTPException(status_code=403, detail="Invalid or Expired Token")
 
-    # 2. Get File Info (Metadata)
+    # 2. Get File Info
     try:
-        # Resolve FileId to get size without downloading
-        # This decodes the file_id string locally (no API call needed yet)
         decoded_file = FileId.decode(file_id)
         file_size = decoded_file.file_size
-        mime_type = "video/x-matroska" # Default for MKV
+        mime_type = "video/x-matroska"
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid File ID")
 
@@ -131,25 +122,20 @@ async def stream_video(
     
     if range_header:
         try:
-            # Parse "bytes=0-100" or "bytes=0-"
             unit, ranges = range_header.split("=")
             if unit == "bytes":
                 parts = ranges.split("-")
                 start = int(parts[0]) if parts[0] else 0
                 end = int(parts[1]) if len(parts) > 1 and parts[1] else file_size - 1
         except ValueError:
-            pass  # Fallback to full stream
+            pass
 
-    # Ensure valid range
     if start >= file_size:
         return Response(status_code=416, headers={"Content-Range": f"bytes */{file_size}"})
     
     end = min(end, file_size - 1)
     content_length = end - start + 1
 
-    # 4. Stream Response with Concurrency Limit
-    # We wrap the generator execution in the response
-    
     headers = {
         "Content-Range": f"bytes {start}-{end}/{file_size}",
         "Accept-Ranges": "bytes",
@@ -159,15 +145,11 @@ async def stream_video(
     }
 
     async def protected_generator():
-        # Acquire slot
         try:
             async with StreamManager():
                 async for chunk in telegram_file_generator(client, file_id, start, end):
                     yield chunk
-        except HTTPException as e:
-            # If busy, the client connection drops. 
-            # In a real Generator, we can't easily change HTTP status code once headers are sent.
-            # But the connection will close.
+        except HTTPException:
             pass
         except Exception as e:
             print(f"Streaming error: {e}")
@@ -181,4 +163,4 @@ async def stream_video(
 
 if __name__ == "__main__":
     uvicorn.run(app, host=config.BIND_ADDR, port=config.PORT)
-              
+    
