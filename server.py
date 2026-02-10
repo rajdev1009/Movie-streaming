@@ -9,18 +9,21 @@ from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.responses import StreamingResponse, HTMLResponse
 from pyrogram import Client, filters
 from pyrogram.types import Message
+# RAW Telegram Functions (To bypass Pyrogram errors)
+from pyrogram.raw.functions.upload import GetFile
+from pyrogram.raw.types import InputDocumentFileLocation
+from pyrogram.file_id import FileId
 import uvicorn
 import config
 
 # --- Client Setup ---
-# STABILITY FIX: ipv6=False is crucial for Koyeb/Telegram connection
 client = Client(
     "unified_session",
     api_id=config.API_ID,
     api_hash=config.API_HASH,
     bot_token=config.BOT_TOKEN,
     in_memory=True,
-    ipv6=False
+    ipv6=False # Network Stability
 )
 
 app = FastAPI()
@@ -45,7 +48,7 @@ def verify_token(file_id: str, token: str, expiry: int) -> bool:
 # --- Bot Handlers ---
 @client.on_message(filters.command("start"))
 async def start_handler(c: Client, m: Message):
-    await m.reply_text("✅ **Bot Online!**\nSend me an MKV file to watch.")
+    await m.reply_text("✅ **Bot Online!**\nSend me an MKV file.")
 
 @client.on_message(filters.video | filters.document)
 async def video_handler(c: Client, m: Message):
@@ -53,7 +56,6 @@ async def video_handler(c: Client, m: Message):
     if not media: return
     
     file_size = media.file_size or 1024*1024*10
-    
     watch_link = generate_secure_link(media.file_id, file_size, endpoint="watch")
     filename = media.file_name or "video.mp4"
     
@@ -88,28 +90,56 @@ class StreamManager:
         async with lock:
             active_streams_count -= 1
 
-# --- STREAM GENERATOR (Stable) ---
-async def file_generator(client: Client, file_id: str, start: int, end: int):
-    length = end - start + 1
-    # Using standard stream_media with offset. 
-    # ipv6=False in client config prevents the black screen/timeout issues.
+# --- THE FIX: Raw Chunk Generator ---
+# This bypasses Pyrogram's stream_media logic entirely to prevent OffsetInvalid
+async def file_generator(client: Client, file_id_str: str, start: int, end: int):
     try:
-        async for chunk in client.stream_media(file_id, offset=start):
-            if length <= 0:
-                break
-            chunk_len = len(chunk)
-            if chunk_len > length:
-                yield chunk[:length]
-                length = 0
-                break
-            else:
-                yield chunk
-                length -= chunk_len
-    except Exception as e:
-        print(f"Stream Error: {e}")
-        pass
+        # Decode the FileID to get raw location data
+        decoded = FileId.decode(file_id_str)
+        location = InputDocumentFileLocation(
+            id=decoded.media_id,
+            access_hash=decoded.access_hash,
+            file_reference=decoded.file_reference,
+            thumb_size=""
+        )
+    except Exception:
+        return
 
-# --- HTML Player Endpoint (UI Fixed) ---
+    offset = start
+    # We request exactly 1MB chunks (1024*1024)
+    chunk_limit = 1024 * 1024 
+    
+    while True:
+        # Calculate how many bytes are left to send in this Range request
+        left_to_send = end - offset + 1
+        if left_to_send <= 0:
+            break
+        
+        # We ask Telegram for EITHER 1MB OR whatever is left (whichever is smaller)
+        # This prevents asking for bytes beyond the file size (OFFSET_INVALID fix)
+        request_size = min(left_to_send, chunk_limit)
+        
+        try:
+            # Direct RAW API call
+            r = await client.invoke(
+                GetFile(
+                    location=location,
+                    offset=offset,
+                    limit=request_size
+                )
+            )
+            
+            if not r or not r.bytes:
+                break
+                
+            yield r.bytes
+            offset += len(r.bytes)
+            
+        except Exception as e:
+            print(f"Gen Error: {e}")
+            break
+
+# --- HTML Player (Centered + Playit) ---
 @app.get("/watch", response_class=HTMLResponse)
 async def watch_video(request: Request, file_id: str, size: int, token: str, exp: int):
     if not verify_token(file_id, token, exp):
@@ -125,34 +155,30 @@ async def watch_video(request: Request, file_id: str, size: int, token: str, exp
         <title>Astra Player</title>
         <style>
             body {{ 
-                background: #000000; 
+                background: #000; 
                 margin: 0; 
                 height: 100vh; 
                 display: flex; 
                 flex-direction: column; 
-                justify-content: center; /* Vertically Center */
-                align-items: center; /* Horizontally Center */
+                justify-content: center; 
+                align-items: center; 
                 font-family: sans-serif;
             }}
-            
             video {{ 
                 width: 95%; 
                 max-width: 800px; 
                 border-radius: 8px; 
                 background: #000; 
                 box-shadow: 0 0 20px rgba(255,255,255,0.1);
-                max-height: 70vh;
             }}
-
             .btn-container {{ 
-                margin-top: 40px; /* Exactly ~1 cm gap */
+                margin-top: 40px; 
                 display: flex; 
                 gap: 15px; 
                 flex-wrap: wrap; 
                 justify-content: center; 
                 width: 100%;
             }}
-
             .btn {{ 
                 padding: 12px 25px; 
                 border-radius: 50px; 
@@ -164,33 +190,21 @@ async def watch_video(request: Request, file_id: str, size: int, token: str, exp
                 cursor: pointer; 
                 display: flex;
                 align-items: center;
-                transition: transform 0.2s;
+                background: #333;
             }}
-            
-            .btn:active {{ transform: scale(0.95); }}
-            
             .vlc {{ background: linear-gradient(45deg, #ff5722, #ff9800); }}
             .playit {{ background: linear-gradient(45deg, #5c3eff, #9e3eff); }}
-            
         </style>
     </head>
     <body>
-        
         <video controls autoplay playsinline>
             <source src="{stream_url}" type="video/mp4">
             Your browser does not support the video tag.
         </video>
-
         <div class="btn-container">
-            <a href="intent:{stream_url}#Intent;package=org.videolan.vlc;type=video/*;scheme=https;end" class="btn vlc">
-                Open in VLC
-            </a>
-            
-            <a href="intent:{stream_url}#Intent;package=com.playit.videoplayer;type=video/*;scheme=https;end" class="btn playit">
-                Open in Playit
-            </a>
+            <a href="intent:{stream_url}#Intent;package=org.videolan.vlc;type=video/*;scheme=https;end" class="btn vlc">Open in VLC</a>
+            <a href="intent:{stream_url}#Intent;package=com.playit.videoplayer;type=video/*;scheme=https;end" class="btn playit">Open in Playit</a>
         </div>
-
     </body>
     </html>
     """
