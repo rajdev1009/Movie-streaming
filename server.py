@@ -86,62 +86,34 @@ class StreamManager:
         async with lock:
             active_streams_count -= 1
 
-# --- THE ZIDDI GENERATOR (Auto-Reconnect) ---
+# --- SAFE GENERATOR (No Manual Offset Math) ---
 async def file_generator(client: Client, file_id_str: str, start: int, end: int):
-    # 1. Alignment Logic (Offset Fix)
-    offset = start - (start % 4096)
-    first_chunk_skip = start - offset
+    # Pyrogram handles offsets internally. We rely on it completely.
+    # This prevents [400 OFFSET_INVALID] because we don't calculate chunks manually.
     
     total_bytes_to_serve = end - start + 1
     bytes_served = 0
     
-    # Track current offset for reconnection
-    current_offset = offset
-    
-    # 2. Retry Loop (Agar connection toota, to wapas wahi se shuru karega)
-    while bytes_served < total_bytes_to_serve:
-        try:
-            # Native Streaming (DC Fix)
-            async for chunk in client.stream_media(file_id_str, offset=current_offset):
-                
-                # Skipping logic (Only for the very first connection)
-                if first_chunk_skip > 0:
-                    if len(chunk) > first_chunk_skip:
-                        chunk = chunk[first_chunk_skip:]
-                        first_chunk_skip = 0
-                    else:
-                        first_chunk_skip -= len(chunk)
-                        current_offset += len(chunk) # Update offset internally
-                        continue
-
-                chunk_len = len(chunk)
-                
-                # Check if we are done
-                if bytes_served + chunk_len > total_bytes_to_serve:
-                    remaining = total_bytes_to_serve - bytes_served
-                    yield chunk[:remaining]
-                    bytes_served += remaining
-                    break
-                
-                yield chunk
-                
-                # Update counters
-                bytes_served += chunk_len
-                current_offset += chunk_len
-                
-                if bytes_served >= total_bytes_to_serve:
-                    break
+    try:
+        # We simply ask: "Start streaming from this byte"
+        async for chunk in client.stream_media(file_id_str, offset=start):
+            chunk_len = len(chunk)
             
-            # Agar loop normal khatam hua aur data pura ho gaya
+            # If we got more data than requested, trim the end
+            if bytes_served + chunk_len > total_bytes_to_serve:
+                remaining = total_bytes_to_serve - bytes_served
+                yield chunk[:remaining]
+                break
+            
+            yield chunk
+            bytes_served += chunk_len
+            
             if bytes_served >= total_bytes_to_serve:
                 break
                 
-        except Exception as e:
-            # 3. Connection Error Handling
-            print(f"Connection dropped: {e}. Reconnecting...")
-            await asyncio.sleep(1) # Wait 1 sec before reconnecting
-            # Loop wapas chalega aur 'current_offset' se download continue karega
-            continue
+    except Exception as e:
+        print(f"Stream Error: {e}")
+        pass
 
 # --- UI HTML Player ---
 @app.get("/watch", response_class=HTMLResponse)
@@ -181,6 +153,7 @@ async def watch_video(request: Request, file_id: str, size: int, token: str, exp
             .dl-big {{ font-size: 1.6em; font-weight: 900; display: block; text-transform: uppercase; }}
             .dl-icon-right {{ font-size: 1.8em; margin-left: 15px; }}
             .footer-text {{ font-weight: bold; margin-bottom: 15px; font-size: 1.2em; }}
+            @media (max-width: 400px) {{ .header-title {{ font-size: 2.8em; }} .channel-name {{ font-size: 2.2em; }} .player-link {{ font-size: 1.8em; }} .middle-img {{ max-width: 100px; }} }}
         </style>
     </head>
     <body>
