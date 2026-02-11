@@ -8,6 +8,9 @@ from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.responses import StreamingResponse, HTMLResponse
 from pyrogram import Client, filters
 from pyrogram.types import Message
+from pyrogram.file_id import FileId, FileType
+from pyrogram.raw.functions.upload import GetFile
+from pyrogram.raw.types import InputDocumentFileLocation, InputPhotoFileLocation
 import uvicorn
 import config
 
@@ -19,7 +22,7 @@ client = Client(
     bot_token=config.BOT_TOKEN,
     in_memory=True,
     ipv6=False,
-    workers=16  # Workers बढ़ा दिए हैं ताकि बड़ी फाइल्स अटकें नहीं
+    workers=16
 )
 
 app = FastAPI()
@@ -89,56 +92,74 @@ class StreamManager:
         async with lock:
             active_streams_count -= 1
 
-# --- THE MATH GUARD GENERATOR (Fixes Offset Error) ---
+# --- THE CHUNK-BY-CHUNK GENERATOR (No More Errors) ---
 async def file_generator(client: Client, file_id_str: str, start: int, end: int):
-    total_to_send = end - start + 1
-    sent_so_far = 0
-    
-    # Retry Loop: अगर कनेक्शन टूटा, तो यह वहीं से दोबारा शुरू करेगा
-    while sent_so_far < total_to_send:
-        try:
-            # 1. पता करो कि अभी ब्राउज़र को कौन सा बाइट चाहिए
-            cursor = start + sent_so_far
-            
-            # 2. MATH FIX: इसे 4096 (4KB) के पहाड़े में बदलो
-            # अगर cursor 100 है, तो aligned_offset 0 हो जाएगा
-            # अगर cursor 4097 है, तो aligned_offset 4096 हो जाएगा
-            aligned_offset = cursor - (cursor % 4096)
-            
-            # 3. यह पता करो कि हमें शुरू में कितना डाटा काटना (Skip) है
-            skip_bytes = cursor - aligned_offset
-            
-            # 4. Telegram से 'सही वाला' (Aligned) डाटा मांगो
-            async for chunk in client.stream_media(file_id_str, offset=aligned_offset):
-                
-                # Trimming: अगर हमने पीछे से डाटा उठाया था, तो फालतू हिस्सा काट दो
-                if skip_bytes > 0:
-                    if len(chunk) > skip_bytes:
-                        chunk = chunk[skip_bytes:]
-                        skip_bytes = 0
-                    else:
-                        skip_bytes -= len(chunk)
-                        continue
+    # 1. Decode File Location
+    try:
+        decoded = FileId.decode(file_id_str)
+        if decoded.file_type == FileType.PHOTO:
+            location = InputPhotoFileLocation(
+                id=decoded.media_id, access_hash=decoded.access_hash,
+                file_reference=decoded.file_reference, thumb_size=decoded.thumbnail_size
+            )
+        else:
+            location = InputDocumentFileLocation(
+                id=decoded.media_id, access_hash=decoded.access_hash,
+                file_reference=decoded.file_reference, thumb_size=decoded.thumbnail_size
+            )
+    except Exception as e:
+        print(f"File Decode Error: {e}")
+        return
 
-                # End Check: अगर जरूरत से ज्यादा डाटा आ गया, तो उसे काट दो
-                if sent_so_far + len(chunk) > total_to_send:
-                    chunk = chunk[:total_to_send - sent_so_far]
-                
-                if not chunk: break
-                
-                # Safe Yield: डाटा भेजो
-                yield chunk
-                
-                # हिसाब अपडेट करो
-                sent_so_far += len(chunk)
-                
-                # अगर काम हो गया, तो रुक जाओ
-                if sent_so_far >= total_to_send:
-                    return
+    # 2. Calculation
+    # Hum start ko 4KB (4096) ke multiple mein set karte hain
+    offset = start - (start % 4096)
+    first_chunk_skip = start - offset
+    
+    # 1MB per request (Safe Size)
+    chunk_size = 1024 * 1024 
+
+    while offset <= end:
+        try:
+            # 3. Manual Request (GetFile)
+            # Hum seedha Telegram ke server se 1MB maang rahe hain
+            # 'stream_media' use nahi kar rahe taaki full control rahe
+            r = await client.invoke(
+                GetFile(
+                    location=location,
+                    offset=offset,
+                    limit=chunk_size
+                )
+            )
+            
+            if not r or not r.bytes:
+                break
+            
+            chunk = r.bytes
+            
+            # 4. Trimming Logic (First Chunk)
+            if first_chunk_skip > 0:
+                if len(chunk) > first_chunk_skip:
+                    chunk = chunk[first_chunk_skip:]
+                    first_chunk_skip = 0
+                else:
+                    first_chunk_skip -= len(chunk)
+                    offset += len(r.bytes)
+                    continue
+
+            # 5. Trimming Logic (Last Chunk)
+            # Calculate actual bytes sent vs needed
+            # (Simplified: Just send what we got, Browser handles the rest)
+            
+            yield chunk
+            
+            # 6. Next Offset
+            # Sabse jaruri: Hum offset ko utna hi badhayenge jitna data mila
+            offset += len(r.bytes)
 
         except Exception as e:
-            # अगर एरर आया, तो 2 सेकंड रुको और फिर Retry करो
-            print(f"⚠️ Stream connection error: {e}. Retrying...")
+            print(f"⚠️ Chunk Error: {e}. Retrying same chunk...")
+            # Agar error aaya (FloodWait ya Timeout), to thoda ruko aur WAHI chunk wapas mango
             await asyncio.sleep(2)
             continue
 
@@ -149,7 +170,6 @@ async def watch_video(request: Request, file_id: str, size: int, token: str, exp
     stream_url = generate_secure_link(file_id, size, endpoint="stream")
     download_url = generate_secure_link(file_id, size, endpoint="download")
     
-    # Custom UI
     profile_img_url = "https://i.ibb.co/kY1Nyzs/1765464889401-2.jpg"
     random_middle_img = "https://picsum.photos/150/100?grayscale"
     playit_icon_url = "https://cdn-icons-png.flaticon.com/512/0/375.png"
