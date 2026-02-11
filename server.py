@@ -86,16 +86,33 @@ class StreamManager:
         async with lock:
             active_streams_count -= 1
 
-# --- FIX: NATIVE GENERATOR (Auto DC Switch) ---
+# --- STABLE GENERATOR (Native + Offset Fix) ---
 async def file_generator(client: Client, file_id_str: str, start: int, end: int):
+    # 1. Math Fix: Start ko 4096 ke multiple me convert karo (OFFSET_INVALID se bachne ke liye)
+    offset = start - (start % 4096)
+    first_chunk_skip = start - offset
+    
     total_bytes_to_serve = end - start + 1
     bytes_served = 0
     
     try:
-        # stream_media handles FILE_MIGRATE automatically
-        async for chunk in client.stream_media(file_id_str, offset=start):
+        # 2. Native Streaming: Pyrogram khud DC switch handle karega (FILE_MIGRATE fix)
+        # Hum aligned 'offset' pass kar rahe hain taaki Telegram error na de.
+        async for chunk in client.stream_media(file_id_str, offset=offset):
+            
+            # 3. Trimming: Agar humne thoda peeche se start kiya tha (alignment ke liye),
+            # to shuru ka faaltu data kaat do.
+            if first_chunk_skip > 0:
+                if len(chunk) > first_chunk_skip:
+                    chunk = chunk[first_chunk_skip:]
+                    first_chunk_skip = 0
+                else:
+                    first_chunk_skip -= len(chunk)
+                    continue
+
             chunk_len = len(chunk)
             
+            # 4. End Trimming: Agar user ko sirf aadha video chahiye, to wahi roko.
             if bytes_served + chunk_len > total_bytes_to_serve:
                 remaining = total_bytes_to_serve - bytes_served
                 yield chunk[:remaining]
@@ -118,6 +135,7 @@ async def watch_video(request: Request, file_id: str, size: int, token: str, exp
     stream_url = generate_secure_link(file_id, size, endpoint="stream")
     download_url = generate_secure_link(file_id, size, endpoint="download")
     
+    # UI Variables
     profile_img_url = "https://i.ibb.co/kY1Nyzs/1765464889401-2.jpg"
     random_middle_img = "https://picsum.photos/150/100?grayscale"
     playit_icon_url = "https://cdn-icons-png.flaticon.com/512/0/375.png"
@@ -149,6 +167,7 @@ async def watch_video(request: Request, file_id: str, size: int, token: str, exp
             .dl-big {{ font-size: 1.6em; font-weight: 900; display: block; text-transform: uppercase; }}
             .dl-icon-right {{ font-size: 1.8em; margin-left: 15px; }}
             .footer-text {{ font-weight: bold; margin-bottom: 15px; font-size: 1.2em; }}
+            @media (max-width: 400px) {{ .header-title {{ font-size: 2.8em; }} .channel-name {{ font-size: 2.2em; }} .player-link {{ font-size: 1.8em; }} .middle-img {{ max-width: 100px; }} }}
         </style>
     </head>
     <body>
