@@ -8,9 +8,6 @@ from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.responses import StreamingResponse, HTMLResponse
 from pyrogram import Client, filters
 from pyrogram.types import Message
-from pyrogram.file_id import FileId, FileType
-from pyrogram.raw.functions.upload import GetFile
-from pyrogram.raw.types import InputDocumentFileLocation, InputPhotoFileLocation
 import uvicorn
 import config
 
@@ -62,10 +59,7 @@ async def video_handler(c: Client, m: Message):
     watch_link = generate_secure_link(media.file_id, file_size, endpoint="watch")
     filename = media.file_name or "video.mp4"
     await m.reply_text(
-        f"🎬 **File:** `{filename}`\n"
-        f"📦 **Size:** `{human_size(file_size)}`\n\n"
-        f"▶️ **Click to Watch / Download:**\n{watch_link}\n\n"
-        f"⚠️ Expires in {config.TOKEN_EXPIRY // 60} mins."
+        f"🎬 **File:** `{filename}`\n📦 **Size:** `{human_size(file_size)}`\n\n▶️ **Click to Watch / Download:**\n{watch_link}\n\n⚠️ Expires in {config.TOKEN_EXPIRY // 60} mins."
     )
 
 # --- Server Logic ---
@@ -92,74 +86,52 @@ class StreamManager:
         async with lock:
             active_streams_count -= 1
 
-# --- THE CHUNK-BY-CHUNK GENERATOR (No More Errors) ---
+# --- THE "LOOPING STREAM" GENERATOR (Ultimate Fix) ---
 async def file_generator(client: Client, file_id_str: str, start: int, end: int):
-    # 1. Decode File Location
-    try:
-        decoded = FileId.decode(file_id_str)
-        if decoded.file_type == FileType.PHOTO:
-            location = InputPhotoFileLocation(
-                id=decoded.media_id, access_hash=decoded.access_hash,
-                file_reference=decoded.file_reference, thumb_size=decoded.thumbnail_size
-            )
-        else:
-            location = InputDocumentFileLocation(
-                id=decoded.media_id, access_hash=decoded.access_hash,
-                file_reference=decoded.file_reference, thumb_size=decoded.thumbnail_size
-            )
-    except Exception as e:
-        print(f"File Decode Error: {e}")
-        return
-
-    # 2. Calculation
-    # Hum start ko 4KB (4096) ke multiple mein set karte hain
+    # 1. Alignment Logic (Telegram 4KB Rule)
+    # Start point ko 4096 se align karo
     offset = start - (start % 4096)
     first_chunk_skip = start - offset
     
-    # 1MB per request (Safe Size)
-    chunk_size = 1024 * 1024 
+    # Chunk Size: 1MB (Safe & Stable)
+    chunk_limit = 1024 * 1024 
 
     while offset <= end:
         try:
-            # 3. Manual Request (GetFile)
-            # Hum seedha Telegram ke server se 1MB maang rahe hain
-            # 'stream_media' use nahi kar rahe taaki full control rahe
-            r = await client.invoke(
-                GetFile(
-                    location=location,
-                    offset=offset,
-                    limit=chunk_size
-                )
-            )
-            
-            if not r or not r.bytes:
-                break
-            
-            chunk = r.bytes
-            
-            # 4. Trimming Logic (First Chunk)
-            if first_chunk_skip > 0:
-                if len(chunk) > first_chunk_skip:
-                    chunk = chunk[first_chunk_skip:]
-                    first_chunk_skip = 0
-                else:
-                    first_chunk_skip -= len(chunk)
-                    offset += len(r.bytes)
-                    continue
+            # 2. Use stream_media BUT with a limit!
+            # Ye 'offset' aur 'limit' leta hai aur khud DC4/DC5 par switch karta hai.
+            async for chunk in client.stream_media(file_id_str, offset=offset, limit=chunk_limit):
+                
+                # 3. Trimming Logic (First Chunk Only)
+                if first_chunk_skip > 0:
+                    if len(chunk) > first_chunk_skip:
+                        chunk = chunk[first_chunk_skip:]
+                        first_chunk_skip = 0
+                    else:
+                        first_chunk_skip -= len(chunk)
+                        offset += len(chunk)
+                        continue
 
-            # 5. Trimming Logic (Last Chunk)
-            # Calculate actual bytes sent vs needed
-            # (Simplified: Just send what we got, Browser handles the rest)
+                # 4. End Check
+                # Agar user ko end tak nahi chahiye (pause/seek), to extra mat bhejo
+                bytes_needed = end - (offset - (len(chunk) if first_chunk_skip == 0 else 0)) + 1
+                # (Simple logic: just send, browser handles excess)
+                
+                yield chunk
+                
+                # 5. Offset Update & Break
+                # Jaise hi ek chunk mila, offset update karo
+                offset += len(chunk)
+                
+                # Pyrogram stream automatically continues, but we want to break 
+                # after 1MB to refresh connection and prevent timeouts.
+                # However, stream_media with limit automatically stops.
+                
+            # Loop wapas chalega agle 1MB ke liye
             
-            yield chunk
-            
-            # 6. Next Offset
-            # Sabse jaruri: Hum offset ko utna hi badhayenge jitna data mila
-            offset += len(r.bytes)
-
         except Exception as e:
-            print(f"⚠️ Chunk Error: {e}. Retrying same chunk...")
-            # Agar error aaya (FloodWait ya Timeout), to thoda ruko aur WAHI chunk wapas mango
+            # FloodWait ya Timeout handle karne ke liye
+            print(f"⚠️ Stream Error: {e}. Retrying same segment...")
             await asyncio.sleep(2)
             continue
 
@@ -237,7 +209,6 @@ async def stream_logic(request: Request, file_id: str, size: int, disposition: s
     file_size = size
     range_header = request.headers.get("range")
     start, end = 0, file_size - 1
-    
     if range_header:
         try:
             unit, r = range_header.split("=")
@@ -248,10 +219,8 @@ async def stream_logic(request: Request, file_id: str, size: int, disposition: s
         except: pass
 
     if start >= file_size: return Response(status_code=416, headers={"Content-Range": f"bytes */{file_size}"})
-
     end = min(end, file_size - 1)
     content_length = end - start + 1
-
     headers = {
         "Content-Range": f"bytes {start}-{end}/{file_size}",
         "Accept-Ranges": "bytes",
@@ -260,14 +229,12 @@ async def stream_logic(request: Request, file_id: str, size: int, disposition: s
         "Content-Disposition": disposition,
         "Connection": "keep-alive"
     }
-
     async def gen():
         try:
             async with StreamManager():
                 async for chunk in file_generator(client, file_id, start, end):
                     yield chunk
         except: pass
-
     return StreamingResponse(gen(), status_code=206, headers=headers)
 
 @app.get("/stream")
