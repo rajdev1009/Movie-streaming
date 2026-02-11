@@ -19,7 +19,7 @@ client = Client(
     bot_token=config.BOT_TOKEN,
     in_memory=True,
     ipv6=False,
-    workers=8 # Increased workers for heavy files
+    workers=16  # Workers बढ़ा दिए हैं ताकि बड़ी फाइल्स अटकें नहीं
 )
 
 app = FastAPI()
@@ -59,7 +59,10 @@ async def video_handler(c: Client, m: Message):
     watch_link = generate_secure_link(media.file_id, file_size, endpoint="watch")
     filename = media.file_name or "video.mp4"
     await m.reply_text(
-        f"🎬 **File:** `{filename}`\n📦 **Size:** `{human_size(file_size)}`\n\n▶️ **Click to Watch / Download:**\n{watch_link}\n\n⚠️ Expires in {config.TOKEN_EXPIRY // 60} mins."
+        f"🎬 **File:** `{filename}`\n"
+        f"📦 **Size:** `{human_size(file_size)}`\n\n"
+        f"▶️ **Click to Watch / Download:**\n{watch_link}\n\n"
+        f"⚠️ Expires in {config.TOKEN_EXPIRY // 60} mins."
     )
 
 # --- Server Logic ---
@@ -86,25 +89,29 @@ class StreamManager:
         async with lock:
             active_streams_count -= 1
 
-# --- THE PRO GENERATOR (Robust & Silent) ---
+# --- THE MATH GUARD GENERATOR (Fixes Offset Error) ---
 async def file_generator(client: Client, file_id_str: str, start: int, end: int):
     total_to_send = end - start + 1
     sent_so_far = 0
     
+    # Retry Loop: अगर कनेक्शन टूटा, तो यह वहीं से दोबारा शुरू करेगा
     while sent_so_far < total_to_send:
         try:
-            # 1. Calculation (Current Position)
+            # 1. पता करो कि अभी ब्राउज़र को कौन सा बाइट चाहिए
             cursor = start + sent_so_far
             
-            # 2. Alignment (Fix for OFFSET_INVALID)
-            # 4096 se divide hone wale number se hi start karenge
+            # 2. MATH FIX: इसे 4096 (4KB) के पहाड़े में बदलो
+            # अगर cursor 100 है, तो aligned_offset 0 हो जाएगा
+            # अगर cursor 4097 है, तो aligned_offset 4096 हो जाएगा
             aligned_offset = cursor - (cursor % 4096)
+            
+            # 3. यह पता करो कि हमें शुरू में कितना डाटा काटना (Skip) है
             skip_bytes = cursor - aligned_offset
             
-            # 3. Stream from Telegram
+            # 4. Telegram से 'सही वाला' (Aligned) डाटा मांगो
             async for chunk in client.stream_media(file_id_str, offset=aligned_offset):
                 
-                # Trim start (Alignment correction)
+                # Trimming: अगर हमने पीछे से डाटा उठाया था, तो फालतू हिस्सा काट दो
                 if skip_bytes > 0:
                     if len(chunk) > skip_bytes:
                         chunk = chunk[skip_bytes:]
@@ -113,28 +120,26 @@ async def file_generator(client: Client, file_id_str: str, start: int, end: int)
                         skip_bytes -= len(chunk)
                         continue
 
-                # Trim end (Don't send extra)
+                # End Check: अगर जरूरत से ज्यादा डाटा आ गया, तो उसे काट दो
                 if sent_so_far + len(chunk) > total_to_send:
                     chunk = chunk[:total_to_send - sent_so_far]
                 
                 if not chunk: break
                 
-                # 4. Safe Yield (Fix for RuntimeError)
-                try:
-                    yield chunk
-                except Exception:
-                    # Agar Browser bhag gaya, to hum bhi ruk jayenge
-                    return 
-
+                # Safe Yield: डाटा भेजो
+                yield chunk
+                
+                # हिसाब अपडेट करो
                 sent_so_far += len(chunk)
                 
+                # अगर काम हो गया, तो रुक जाओ
                 if sent_so_far >= total_to_send:
                     return
 
         except Exception as e:
-            # Agar Telegram ne connection kaata, to hum retry karenge
-            # Lekin log mein error spam nahi karenge
-            await asyncio.sleep(1)
+            # अगर एरर आया, तो 2 सेकंड रुको और फिर Retry करो
+            print(f"⚠️ Stream connection error: {e}. Retrying...")
+            await asyncio.sleep(2)
             continue
 
 # --- UI HTML Player ---
@@ -144,6 +149,7 @@ async def watch_video(request: Request, file_id: str, size: int, token: str, exp
     stream_url = generate_secure_link(file_id, size, endpoint="stream")
     download_url = generate_secure_link(file_id, size, endpoint="download")
     
+    # Custom UI
     profile_img_url = "https://i.ibb.co/kY1Nyzs/1765464889401-2.jpg"
     random_middle_img = "https://picsum.photos/150/100?grayscale"
     playit_icon_url = "https://cdn-icons-png.flaticon.com/512/0/375.png"
@@ -211,6 +217,7 @@ async def stream_logic(request: Request, file_id: str, size: int, disposition: s
     file_size = size
     range_header = request.headers.get("range")
     start, end = 0, file_size - 1
+    
     if range_header:
         try:
             unit, r = range_header.split("=")
@@ -221,8 +228,10 @@ async def stream_logic(request: Request, file_id: str, size: int, disposition: s
         except: pass
 
     if start >= file_size: return Response(status_code=416, headers={"Content-Range": f"bytes */{file_size}"})
+
     end = min(end, file_size - 1)
     content_length = end - start + 1
+
     headers = {
         "Content-Range": f"bytes {start}-{end}/{file_size}",
         "Accept-Ranges": "bytes",
@@ -231,12 +240,14 @@ async def stream_logic(request: Request, file_id: str, size: int, disposition: s
         "Content-Disposition": disposition,
         "Connection": "keep-alive"
     }
+
     async def gen():
         try:
             async with StreamManager():
                 async for chunk in file_generator(client, file_id, start, end):
                     yield chunk
         except: pass
+
     return StreamingResponse(gen(), status_code=206, headers=headers)
 
 @app.get("/stream")
