@@ -86,34 +86,53 @@ class StreamManager:
         async with lock:
             active_streams_count -= 1
 
-# --- SAFE GENERATOR (No Manual Offset Math) ---
+# --- THE BULLETPROOF GENERATOR ---
 async def file_generator(client: Client, file_id_str: str, start: int, end: int):
-    # Pyrogram handles offsets internally. We rely on it completely.
-    # This prevents [400 OFFSET_INVALID] because we don't calculate chunks manually.
+    total_to_send = end - start + 1
+    sent_so_far = 0
     
-    total_bytes_to_serve = end - start + 1
-    bytes_served = 0
-    
-    try:
-        # We simply ask: "Start streaming from this byte"
-        async for chunk in client.stream_media(file_id_str, offset=start):
-            chunk_len = len(chunk)
+    # Retry Loop: Agar connection toota, to wapas wahi se shuru karega
+    while sent_so_far < total_to_send:
+        try:
+            # 1. Current cursor position (Browser ko abhi ye chahiye)
+            cursor = start + sent_so_far
             
-            # If we got more data than requested, trim the end
-            if bytes_served + chunk_len > total_bytes_to_serve:
-                remaining = total_bytes_to_serve - bytes_served
-                yield chunk[:remaining]
-                break
+            # 2. ALIGNMENT (The Fix for 400 OFFSET_INVALID)
+            # Telegram sirf 4096 ke multiple wale offset manta hai.
+            # Agar cursor 4097 hai, to hum 4096 mangenge.
+            aligned_offset = cursor - (cursor % 4096)
             
-            yield chunk
-            bytes_served += chunk_len
+            # Kitna data kaatna padega shuru mein?
+            skip_bytes = cursor - aligned_offset
             
-            if bytes_served >= total_bytes_to_serve:
-                break
+            # 3. Request Data from Telegram
+            async for chunk in client.stream_media(file_id_str, offset=aligned_offset):
                 
-    except Exception as e:
-        print(f"Stream Error: {e}")
-        pass
+                # 4. Trimming Logic (Alignment ke liye jo extra manga tha, use hatao)
+                if skip_bytes > 0:
+                    if len(chunk) > skip_bytes:
+                        chunk = chunk[skip_bytes:]
+                        skip_bytes = 0
+                    else:
+                        skip_bytes -= len(chunk)
+                        continue # Agla chunk aane do
+
+                # 5. End Check (Jyada data mat bhejo)
+                if sent_so_far + len(chunk) > total_to_send:
+                    chunk = chunk[:total_to_send - sent_so_far]
+                
+                if not chunk: break
+                
+                yield chunk
+                sent_so_far += len(chunk)
+                
+                if sent_so_far >= total_to_send:
+                    return # Kaam khatam!
+
+        except Exception as e:
+            print(f"⚠️ Reconnecting stream: {e}")
+            await asyncio.sleep(2) # 2 second ruko aur wapas try karo
+            continue
 
 # --- UI HTML Player ---
 @app.get("/watch", response_class=HTMLResponse)
