@@ -19,7 +19,7 @@ client = Client(
     bot_token=config.BOT_TOKEN,
     in_memory=True,
     ipv6=False,
-    workers=4
+    workers=8 # Increased workers for heavy files
 )
 
 app = FastAPI()
@@ -86,52 +86,55 @@ class StreamManager:
         async with lock:
             active_streams_count -= 1
 
-# --- THE BULLETPROOF GENERATOR ---
+# --- THE PRO GENERATOR (Robust & Silent) ---
 async def file_generator(client: Client, file_id_str: str, start: int, end: int):
     total_to_send = end - start + 1
     sent_so_far = 0
     
-    # Retry Loop: Agar connection toota, to wapas wahi se shuru karega
     while sent_so_far < total_to_send:
         try:
-            # 1. Current cursor position (Browser ko abhi ye chahiye)
+            # 1. Calculation (Current Position)
             cursor = start + sent_so_far
             
-            # 2. ALIGNMENT (The Fix for 400 OFFSET_INVALID)
-            # Telegram sirf 4096 ke multiple wale offset manta hai.
-            # Agar cursor 4097 hai, to hum 4096 mangenge.
+            # 2. Alignment (Fix for OFFSET_INVALID)
+            # 4096 se divide hone wale number se hi start karenge
             aligned_offset = cursor - (cursor % 4096)
-            
-            # Kitna data kaatna padega shuru mein?
             skip_bytes = cursor - aligned_offset
             
-            # 3. Request Data from Telegram
+            # 3. Stream from Telegram
             async for chunk in client.stream_media(file_id_str, offset=aligned_offset):
                 
-                # 4. Trimming Logic (Alignment ke liye jo extra manga tha, use hatao)
+                # Trim start (Alignment correction)
                 if skip_bytes > 0:
                     if len(chunk) > skip_bytes:
                         chunk = chunk[skip_bytes:]
                         skip_bytes = 0
                     else:
                         skip_bytes -= len(chunk)
-                        continue # Agla chunk aane do
+                        continue
 
-                # 5. End Check (Jyada data mat bhejo)
+                # Trim end (Don't send extra)
                 if sent_so_far + len(chunk) > total_to_send:
                     chunk = chunk[:total_to_send - sent_so_far]
                 
                 if not chunk: break
                 
-                yield chunk
+                # 4. Safe Yield (Fix for RuntimeError)
+                try:
+                    yield chunk
+                except Exception:
+                    # Agar Browser bhag gaya, to hum bhi ruk jayenge
+                    return 
+
                 sent_so_far += len(chunk)
                 
                 if sent_so_far >= total_to_send:
-                    return # Kaam khatam!
+                    return
 
         except Exception as e:
-            print(f"⚠️ Reconnecting stream: {e}")
-            await asyncio.sleep(2) # 2 second ruko aur wapas try karo
+            # Agar Telegram ne connection kaata, to hum retry karenge
+            # Lekin log mein error spam nahi karenge
+            await asyncio.sleep(1)
             continue
 
 # --- UI HTML Player ---
